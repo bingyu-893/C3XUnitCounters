@@ -167,3 +167,7 @@ Militaristic
 Religious
 Scientific
 Seafaring
+
+; Main-screen combat odds HUD
+Win rate:
+Damage rate:

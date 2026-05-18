@@ -693,6 +693,10 @@ enum c3x_label {
 	CL_SCIENTIFIC,
 	CL_SEAFARING,
 
+	// Main-screen combat odds HUD
+	CL_COMBAT_WIN_CHANCE,
+	CL_BOMBARD_DAMAGE_CHANCE,
+
 	COUNT_C3X_LABELS
 };
 
@@ -1898,6 +1902,8 @@ struct injected_state {
 		int percent;
 		char text[64];
 	} combat_odds_hud;
+	PCX_Image combat_odds_hud_backdrop;
+	enum init_state combat_odds_hud_backdrop_state;
 
 	// Used to extract which unit (if any) exerted zone of control from within Fighter::apply_zone_of_control.
 	Unit * zoc_interceptor;
