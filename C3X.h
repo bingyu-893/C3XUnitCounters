@@ -1899,7 +1899,7 @@ struct injected_state {
 		enum combat_odds_hud_mode mode;
 		int tile_x, tile_y;
 		int attacker_unit_id, target_unit_id;
-		int percent;
+		int percent_basis_points;
 		char text[64];
 	} combat_odds_hud;
 	PCX_Image combat_odds_hud_backdrop;

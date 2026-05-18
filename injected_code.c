@@ -25794,7 +25794,7 @@ draw_combat_odds_hud (Main_Screen_Form * main_screen_form, PCX_Image * canvas)
 	if (is->combat_odds_hud_backdrop_state == IS_UNINITED) {
 		char temp_path[2*MAX_PATH];
 		PCX_Image_construct (&is->combat_odds_hud_backdrop);
-		get_mod_art_path ("CityCountBackdrop.pcx", temp_path, sizeof temp_path);
+		get_mod_art_path ("WinrateBackground.pcx", temp_path, sizeof temp_path);
 		PCX_Image_read_file (&is->combat_odds_hud_backdrop, __, temp_path, NULL, 0, 0x100, 2);
 		is->combat_odds_hud_backdrop_state =
 			(is->combat_odds_hud_backdrop.JGL.Image != NULL) ? IS_OK : IS_INIT_FAILED;
@@ -29726,7 +29726,7 @@ combat_odds_hud_states_equal (struct combat_odds_hud_state const * a,
 	       (a->tile_y == b->tile_y) &&
 	       (a->attacker_unit_id == b->attacker_unit_id) &&
 	       (a->target_unit_id == b->target_unit_id) &&
-	       (a->percent == b->percent) &&
+	       (a->percent_basis_points == b->percent_basis_points) &&
 	       (strcmp (a->text, b->text) == 0);
 }
 
@@ -29752,13 +29752,29 @@ clear_combat_odds_hud_state ()
 }
 
 int
-combat_odds_percent_from_chance (double chance)
+combat_odds_basis_points_from_chance (double chance)
 {
 	if (chance <= 0.0)
 		return 0;
 	if (chance >= 1.0)
-		return 100;
-	return clamp (0, 100, (int)(chance * 100.0 + 0.5));
+		return 10000;
+
+	int basis_points = (int)(chance * 10000.0 + 0.5);
+	return clamp (1, 9999, basis_points);
+}
+
+void
+format_combat_odds_hud_text (char * out,
+                             int out_capacity,
+                             enum c3x_label label,
+                             char const * fallback,
+                             int percent_basis_points)
+{
+	snprintf (out, out_capacity, "%s %d.%02d%%",
+	          c3x_label_or_fallback (label, fallback),
+	          percent_basis_points / 100,
+	          percent_basis_points % 100);
+	out[out_capacity - 1] = '\0';
 }
 
 double
@@ -29846,11 +29862,11 @@ build_attack_combat_odds_hud_state (Main_Screen_Form * main_screen_form,
 	out->tile_y = tile_y;
 	out->attacker_unit_id = attacker->Body.ID;
 	out->target_unit_id = defender->Body.ID;
-	out->percent = combat_odds_percent_from_chance (combat_chance);
-	snprintf (out->text, sizeof out->text, "%s %d%%",
-	          c3x_label_or_fallback (CL_COMBAT_WIN_CHANCE, "Win rate:"),
-	          out->percent);
-	out->text[(sizeof out->text) - 1] = '\0';
+	out->percent_basis_points = combat_odds_basis_points_from_chance (combat_chance);
+	format_combat_odds_hud_text (
+		out->text, sizeof out->text,
+		CL_COMBAT_WIN_CHANCE, "Win rate:",
+		out->percent_basis_points);
 	return true;
 }
 
@@ -29906,11 +29922,11 @@ build_bombard_combat_odds_hud_state (Main_Screen_Form * main_screen_form,
 	out->tile_y = tile_y;
 	out->attacker_unit_id = attacker->Body.ID;
 	out->target_unit_id = target->Body.ID;
-	out->percent = combat_odds_percent_from_chance (1.0 - no_damage_chance);
-	snprintf (out->text, sizeof out->text, "%s %d%%",
-	          c3x_label_or_fallback (CL_BOMBARD_DAMAGE_CHANCE, "Damage rate:"),
-	          out->percent);
-	out->text[(sizeof out->text) - 1] = '\0';
+	out->percent_basis_points = combat_odds_basis_points_from_chance (1.0 - no_damage_chance);
+	format_combat_odds_hud_text (
+		out->text, sizeof out->text,
+		CL_BOMBARD_DAMAGE_CHANCE, "Damage rate:",
+		out->percent_basis_points);
 	return true;
 }
 
