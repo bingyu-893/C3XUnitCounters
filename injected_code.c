@@ -215,6 +215,9 @@ get_city_ptr (int id)
 enum recognizable_parse_result parse_unit_counter_group (char ** p_cursor, struct error_line ** p_unrecognized_lines, void * out_group);
 enum recognizable_parse_result parse_counter_rule (char ** p_cursor, struct error_line ** p_unrecognized_lines, void * out_rule);
 Unit * find_counter_best_defender_against (Unit * attacker, Tile * tile, int tile_x, int tile_y, Unit * excluded, bool require_visible, bool * out_any_counter_effect);
+void draw_combat_odds_hud (Main_Screen_Form * main_screen_form, PCX_Image * canvas);
+void clear_combat_odds_hud_state (void);
+void update_combat_odds_hud_for_hover (Main_Screen_Form * main_screen_form, int local_x, int local_y);
 
 // Declare various functions needed for districts and hard to untangle and reorder here
 void __fastcall patch_City_recompute_yields_and_happiness (City * this);
@@ -18430,6 +18433,7 @@ patch_init_floating_point ()
 		{"remove_land_artillery_target_restrictions"             , false, offsetof (struct c3x_config, remove_land_artillery_target_restrictions)},
 		{"allow_bombard_of_other_improvs_on_occupied_airfield"   , false, offsetof (struct c3x_config, allow_bombard_of_other_improvs_on_occupied_airfield)},
 		{"show_total_city_count"                                 , false, offsetof (struct c3x_config, show_total_city_count)},
+		{"show_combat_odds_on_main_screen"                       , false, offsetof (struct c3x_config, show_combat_odds_on_main_screen)},
 		{"strengthen_forbidden_palace_ocn_effect"                , false, offsetof (struct c3x_config, strengthen_forbidden_palace_ocn_effect)},
 		{"allow_upgrades_in_any_city"                            , false, offsetof (struct c3x_config, allow_upgrades_in_any_city)},
 		{"do_not_generate_volcanos"                              , false, offsetof (struct c3x_config, do_not_generate_volcanos)},
@@ -18781,6 +18785,10 @@ patch_init_floating_point ()
 	is->unit_display_override_2 = (struct unit_display_override) {-1, -1, -1};
 	is->combat_unit_display_override_active = false;
 	is->saved_combat_unit_display_override = (struct unit_display_override) {-1, -1, -1};
+	is->combat_odds_hud = (struct combat_odds_hud_state) {0};
+	is->combat_odds_hud.mode = COHM_NONE;
+	is->combat_odds_hud.tile_x = is->combat_odds_hud.tile_y = -1;
+	is->combat_odds_hud.attacker_unit_id = is->combat_odds_hud.target_unit_id = -1;
 
 	is->dbe = (struct defensive_bombard_event) {0};
 
@@ -25769,6 +25777,70 @@ draw_map_tile_text (Main_Screen_Form * this, PCX_Image * canvas, char * text, in
 	}
 }
 
+void
+draw_combat_odds_hud (Main_Screen_Form * main_screen_form, PCX_Image * canvas)
+{
+	if (! (is->current_config.show_combat_odds_on_main_screen &&
+	       is->combat_odds_hud.active &&
+	       (main_screen_form != NULL) &&
+	       (canvas != NULL) &&
+	       (canvas->JGL.Image != NULL)))
+		return;
+
+	char temp_path[2*MAX_PATH];
+	PCX_Image backdrop;
+	PCX_Image_construct (&backdrop);
+	get_mod_art_path ("CityCountBackdrop.pcx", temp_path, sizeof temp_path);
+	PCX_Image_read_file (&backdrop, __, temp_path, NULL, 0, 0x100, 2);
+
+	int box_w = 300, box_h = 36;
+	if (backdrop.JGL.Image != NULL) {
+		box_w = backdrop.JGL.Image->vtable->m54_Get_Width (backdrop.JGL.Image);
+		box_h = backdrop.JGL.Image->vtable->m55_Get_Height (backdrop.JGL.Image);
+	}
+
+	int canvas_w = canvas->JGL.Image->vtable->m54_Get_Width (canvas->JGL.Image),
+	    canvas_h = canvas->JGL.Image->vtable->m55_Get_Height (canvas->JGL.Image);
+	int max_left = (canvas_w > box_w) ? canvas_w - box_w : 0,
+	    max_top  = (canvas_h > box_h) ? canvas_h - box_h : 0;
+	int left = main_screen_form->GUI.Mini_Map_Click_Rect.right - box_w;
+	int top  = main_screen_form->GUI.Mini_Map_Click_Rect.top - box_h - 6;
+	left = clamp (0, max_left, left);
+	top  = clamp (0, max_top, top);
+
+	if (backdrop.JGL.Image != NULL)
+		PCX_Image_draw_onto (&backdrop, __, canvas, left, top);
+	else {
+		RECT rect = {left, top, left + box_w, top + box_h};
+		PCX_Image_fill_area (canvas, __, &rect, 0);
+	}
+
+	Object_66C3FC * font = get_font (14, FSF_NONE);
+	if (font != NULL) {
+		int text_width = box_w - 16;
+		if (text_width < 20)
+			text_width = box_w;
+		PCX_Image_set_text_effects (canvas, __, 0x80FFFFFF, 0x80000000, 1, 1);
+		PCX_Image_draw_centered_text (canvas, __, font, is->combat_odds_hud.text,
+		                              left + (box_w - text_width) / 2,
+		                              top + (box_h - 14) / 2,
+		                              text_width,
+		                              strlen (is->combat_odds_hud.text));
+	}
+
+	backdrop.vtable->destruct (&backdrop, __, 0);
+}
+
+void __fastcall
+patch_Animator_update (Animator * this)
+{
+	Animator_update (this);
+
+	if ((p_main_screen_form != NULL) &&
+	    (this == &p_main_screen_form->animator))
+		draw_combat_odds_hud (p_main_screen_form, &p_main_screen_form->Base_Data.Canvas);
+}
+
 void __fastcall
 patch_Main_Screen_Form_draw_city_hud (Main_Screen_Form * this, int edx, PCX_Image * canvas)
 {
@@ -29616,6 +29688,294 @@ patch_Unit_check_bombard_target (Unit * this, int edx, int tile_x, int tile_y)
 
 	} else
 		return base;
+}
+
+bool
+is_combat_odds_hud_bombard_mode (int mode_action)
+{
+	return (mode_action == UMA_Bombard) ||
+	       (mode_action == UMA_Air_Bombard) ||
+	       (mode_action == UMA_Auto_Bombard) ||
+	       (mode_action == UMA_Auto_Air_Bombard);
+}
+
+void
+init_empty_combat_odds_hud_state (struct combat_odds_hud_state * state)
+{
+	memset (state, 0, sizeof *state);
+	state->mode = COHM_NONE;
+	state->tile_x = state->tile_y = -1;
+	state->attacker_unit_id = state->target_unit_id = -1;
+}
+
+bool
+combat_odds_hud_states_equal (struct combat_odds_hud_state const * a,
+                              struct combat_odds_hud_state const * b)
+{
+	if (a->active != b->active)
+		return false;
+	if (! a->active)
+		return true;
+	return (a->mode == b->mode) &&
+	       (a->tile_x == b->tile_x) &&
+	       (a->tile_y == b->tile_y) &&
+	       (a->attacker_unit_id == b->attacker_unit_id) &&
+	       (a->target_unit_id == b->target_unit_id) &&
+	       (a->percent == b->percent) &&
+	       (strcmp (a->text, b->text) == 0);
+}
+
+void
+set_combat_odds_hud_state (struct combat_odds_hud_state const * next)
+{
+	if (combat_odds_hud_states_equal (&is->combat_odds_hud, next))
+		return;
+
+	is->combat_odds_hud = *next;
+	if ((p_main_screen_form != NULL) &&
+	    (p_main_screen_form->vtable != NULL) &&
+	    ! p_main_screen_form->is_now_loading_game)
+		p_main_screen_form->vtable->m73_call_m22_Draw ((Base_Form *)p_main_screen_form);
+}
+
+void
+clear_combat_odds_hud_state ()
+{
+	struct combat_odds_hud_state empty;
+	init_empty_combat_odds_hud_state (&empty);
+	set_combat_odds_hud_state (&empty);
+}
+
+double
+round_win_chance_from_combat_odds (int odds)
+{
+	if (odds <= 0)
+		return 0.0;
+	if (odds >= 1024)
+		return 1.0;
+	return (double)odds / 1024.0;
+}
+
+double
+calc_attacker_win_chance_from_round (double attacker_round_win_chance,
+                                     int attacker_hp,
+                                     int defender_hp)
+{
+	if (attacker_hp <= 0)
+		return 0.0;
+	if (defender_hp <= 0)
+		return 1.0;
+	if (attacker_round_win_chance <= 0.0)
+		return 0.0;
+	if (attacker_round_win_chance >= 1.0)
+		return 1.0;
+
+	double defender_round_win_chance = 1.0 - attacker_round_win_chance;
+	double term = 1.0;
+	for (int i = 0; i < defender_hp; i++)
+		term *= attacker_round_win_chance;
+
+	double result = 0.0;
+	for (int attacker_losses = 0; attacker_losses < attacker_hp; attacker_losses++) {
+		result += term;
+		term *= ((double)(defender_hp + attacker_losses) /
+		         (double)(attacker_losses + 1)) *
+		        defender_round_win_chance;
+	}
+
+	if (result < 0.0)
+		return 0.0;
+	if (result > 1.0)
+		return 1.0;
+	return result;
+}
+
+int
+combat_odds_percent_from_chance (double chance)
+{
+	if (chance <= 0.0)
+		return 0;
+	if (chance >= 1.0)
+		return 100;
+	return clamp (0, 100, (int)(chance * 100.0 + 0.5));
+}
+
+int
+get_round_odds_for_hud (Unit * attacker, Unit * defender, int defender_x,
+                        int defender_y, bool bombarding)
+{
+	Fighter saved_fighter = p_bic_data->fighter;
+
+	p_bic_data->fighter.attacker = attacker;
+	p_bic_data->fighter.defender = defender;
+	p_bic_data->fighter.attacker_location_x = attacker->Body.X;
+	p_bic_data->fighter.attacker_location_y = attacker->Body.Y;
+	p_bic_data->fighter.defender_location_x = defender_x;
+	p_bic_data->fighter.defender_location_y = defender_y;
+
+	int odds = bombarding ?
+		patch_Fighter_get_odds_for_bombardment (
+			&p_bic_data->fighter, __, attacker, defender, true, false) :
+		patch_Fighter_get_odds_for_main_combat_loop (
+			&p_bic_data->fighter, __, attacker, defender, false, false);
+
+	p_bic_data->fighter = saved_fighter;
+	is->counter_combat_ctx.active = false;
+	return odds;
+}
+
+bool
+build_attack_combat_odds_hud_state (Main_Screen_Form * main_screen_form,
+                                    Unit * attacker,
+                                    int tile_x,
+                                    int tile_y,
+                                    struct combat_odds_hud_state * out)
+{
+	if (! unit_has_valid_type_id (attacker))
+		return false;
+
+	int neighbor_index = Map_compute_neighbor_index (&p_bic_data->Map, __,
+		attacker->Body.X, attacker->Body.Y, tile_x, tile_y, 8);
+	if ((neighbor_index <= 0) || (neighbor_index > 8))
+		return false;
+	if (patch_Unit_can_move_to_adjacent_tile (attacker, __, neighbor_index, 0) != AMV_OK)
+		return false;
+
+	Tile * tile = tile_at (tile_x, tile_y);
+	Unit * defender = find_counter_best_visible_defender_against (
+		attacker, tile, tile_x, tile_y, NULL);
+	if (! unit_has_valid_type_id (defender))
+		return false;
+
+	int attacker_hp = unit_current_hp (attacker),
+	    defender_hp = unit_current_hp (defender);
+	if ((attacker_hp <= 0) || (defender_hp <= 0))
+		return false;
+
+	int round_odds = get_round_odds_for_hud (attacker, defender, tile_x, tile_y, false);
+	double round_chance = round_win_chance_from_combat_odds (round_odds);
+	double combat_chance = calc_attacker_win_chance_from_round (
+		round_chance, attacker_hp, defender_hp);
+
+	out->active = true;
+	out->mode = COHM_ATTACK;
+	out->tile_x = tile_x;
+	out->tile_y = tile_y;
+	out->attacker_unit_id = attacker->Body.ID;
+	out->target_unit_id = defender->Body.ID;
+	out->percent = combat_odds_percent_from_chance (combat_chance);
+	snprintf (out->text, sizeof out->text, "Win odds: %d%%", out->percent);
+	out->text[(sizeof out->text) - 1] = '\0';
+	return true;
+}
+
+bool
+build_bombard_combat_odds_hud_state (Main_Screen_Form * main_screen_form,
+                                     Unit * attacker,
+                                     int tile_x,
+                                     int tile_y,
+                                     struct combat_odds_hud_state * out)
+{
+	if (! unit_has_valid_type_id (attacker))
+		return false;
+
+	UnitType * attacker_type = &p_bic_data->UnitTypes[attacker->Body.UnitTypeID];
+	if (attacker_type->Bombard_Strength <= 0)
+		return false;
+	if (! patch_Unit_check_bombard_target (attacker, __, tile_x, tile_y))
+		return false;
+
+	Tile * tile = tile_at (tile_x, tile_y);
+	if ((tile == NULL) || (tile == p_null_tile))
+		return false;
+
+	Unit * target = find_counter_best_bombard_defender_against (
+		attacker, tile_x, tile_y, attacker->Body.CivID, true, NULL);
+	if (target == NULL) {
+		bool land_lethal = Unit_has_ability (attacker, __, UTA_Lethal_Land_Bombardment),
+		     sea_lethal  = Unit_has_ability (attacker, __, UTA_Lethal_Sea_Bombardment);
+		target = Fighter_find_defender_against_bombardment (
+			&p_bic_data->fighter, __, attacker, tile_x, tile_y,
+			attacker->Body.CivID, land_lethal, sea_lethal);
+	}
+
+	if (! (unit_has_valid_type_id (target) &&
+	       target->vtable->is_enemy_of_civ (target, __, attacker->Body.CivID, 0) &&
+	       patch_Unit_is_visible_to_civ (target, __, attacker->Body.CivID, 0) &&
+	       can_damage_bombarding (attacker_type, target, tile)))
+		return false;
+
+	int fire_rate = attacker_type->FireRate;
+	if (fire_rate <= 0)
+		return false;
+
+	int round_odds = get_round_odds_for_hud (attacker, target, tile_x, tile_y, true);
+	double round_chance = round_win_chance_from_combat_odds (round_odds);
+	double no_damage_chance = 1.0;
+	for (int i = 0; i < fire_rate; i++)
+		no_damage_chance *= 1.0 - round_chance;
+
+	out->active = true;
+	out->mode = COHM_BOMBARD;
+	out->tile_x = tile_x;
+	out->tile_y = tile_y;
+	out->attacker_unit_id = attacker->Body.ID;
+	out->target_unit_id = target->Body.ID;
+	out->percent = combat_odds_percent_from_chance (1.0 - no_damage_chance);
+	snprintf (out->text, sizeof out->text, "Damage: %d%%", out->percent);
+	out->text[(sizeof out->text) - 1] = '\0';
+	return true;
+}
+
+void
+update_combat_odds_hud_for_hover (Main_Screen_Form * main_screen_form,
+                                  int local_x,
+                                  int local_y)
+{
+	struct combat_odds_hud_state next;
+	init_empty_combat_odds_hud_state (&next);
+
+	if (! (is->current_config.show_combat_odds_on_main_screen &&
+	       (main_screen_form != NULL) &&
+	       (main_screen_form == p_main_screen_form) &&
+	       (*p_player_bits != 0) &&
+	       ! main_screen_form->is_now_loading_game))
+		goto done;
+
+	Unit * attacker = main_screen_form->Current_Unit;
+	if (! (unit_has_valid_type_id (attacker) &&
+	       (attacker->Body.CivID == main_screen_form->Player_CivID)))
+		goto done;
+
+	int tile_x = -1, tile_y = -1;
+	if (Main_Screen_Form_get_tile_coords_under_mouse (
+		    main_screen_form, __, local_x, local_y, &tile_x, &tile_y))
+		goto done;
+
+	wrap_tile_coords (&p_bic_data->Map, &tile_x, &tile_y);
+	Tile * tile = tile_at (tile_x, tile_y);
+	if ((tile == NULL) || (tile == p_null_tile))
+		goto done;
+
+	if (is_combat_odds_hud_bombard_mode (main_screen_form->Mode_Action)) {
+		if (! build_bombard_combat_odds_hud_state (
+			    main_screen_form, attacker, tile_x, tile_y, &next))
+			init_empty_combat_odds_hud_state (&next);
+	} else {
+		if (! build_attack_combat_odds_hud_state (
+			    main_screen_form, attacker, tile_x, tile_y, &next))
+			init_empty_combat_odds_hud_state (&next);
+	}
+
+done:
+	set_combat_odds_hud_state (&next);
+}
+
+void __fastcall
+patch_Main_Screen_Form_process_mouse_hover (Main_Screen_Form * this, int edx, int local_x, int local_y)
+{
+	Main_Screen_Form_process_mouse_hover (this, __, local_x, local_y);
+	update_combat_odds_hud_for_hover (this, local_x, local_y);
 }
 
 bool __fastcall
@@ -38115,6 +38475,9 @@ patch_Main_Screen_Form_set_selected_unit (Main_Screen_Form * this, int edx, Unit
 		UnitIDList_insert_before (&this->selectable_units, __, unit->Body.ID, NULL);
 		this->unit_cycle_cursor = this->selectable_units.first;
 	}
+
+	if (is->combat_odds_hud.active)
+		clear_combat_odds_hud_state ();
 
 	if (redraw && ! this->is_now_loading_game)
 		p_main_screen_form->vtable->m73_call_m22_Draw ((Base_Form *)p_main_screen_form);

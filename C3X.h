@@ -110,6 +110,12 @@ enum unit_cycle_search_criteria {
 	UCSC_SIMILAR_NEAR_DESTINATION
 };
 
+enum combat_odds_hud_mode {
+	COHM_NONE = 0,
+	COHM_ATTACK,
+	COHM_BOMBARD
+};
+
 enum no_ai_patrol_override {
 	NAPO_ZERO = 0,
 	NAPO_ONE,
@@ -347,6 +353,7 @@ struct c3x_config {
 	bool remove_land_artillery_target_restrictions;
 	bool allow_bombard_of_other_improvs_on_occupied_airfield;
 	bool show_total_city_count;
+	bool show_combat_odds_on_main_screen;
 	bool strengthen_forbidden_palace_ocn_effect;
 	int extra_unit_maintenance_per_shields;
 	enum special_zone_of_control_rules special_zone_of_control_rules;
@@ -1882,6 +1889,15 @@ struct injected_state {
 		int    defender_def_pct;  // Defender defense multiplier (combines forward enemy-def and reverse self-def)
 		bool   ignore_terrain;
 	} counter_combat_ctx;
+
+	struct combat_odds_hud_state {
+		bool active;
+		enum combat_odds_hud_mode mode;
+		int tile_x, tile_y;
+		int attacker_unit_id, target_unit_id;
+		int percent;
+		char text[64];
+	} combat_odds_hud;
 
 	// Used to extract which unit (if any) exerted zone of control from within Fighter::apply_zone_of_control.
 	Unit * zoc_interceptor;
