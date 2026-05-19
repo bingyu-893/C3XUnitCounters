@@ -8368,14 +8368,16 @@ apply_counter_rules (struct c3x_config * cfg,
 
 		if (forward) {
 			aa = aa * r->self_atk_pct  / 100;  // self-atk: attacker attack
-			dd = dd * r->enemy_def_pct / 100;  // enemy-def: defender defense
+			if (r->ignore_terrain) {
+				// ignore-terrain replaces this rule's enemy-def effect.
+				ignore = true;
+			} else
+				dd = dd * r->enemy_def_pct / 100;  // enemy-def: defender defense
 		}
 		if (reverse) {
 			aa = aa * r->enemy_atk_pct / 100;  // enemy-atk: rule defender side now acts as attacker
 			dd = dd * r->self_def_pct  / 100;  // self-def: rule attacker side now acts as defender
 		}
-		if (forward || reverse)
-			ignore = ignore || r->ignore_terrain;
 	}
 
 	*out_attacker_atk  = aa;
@@ -25813,7 +25815,7 @@ draw_combat_odds_hud (Main_Screen_Form * main_screen_form, PCX_Image * canvas)
 	int max_left = (canvas_w > box_w) ? canvas_w - box_w : 0,
 	    max_top  = (canvas_h > box_h) ? canvas_h - box_h : 0;
 	int left = minimap.right - box_w;
-	int top  = minimap.top - box_h - 2;
+	int top  = minimap.top - box_h - 1;
 	left = clamp (0, max_left, left);
 	top  = clamp (0, max_top, top);
 
@@ -29008,15 +29010,14 @@ patch_Fighter_get_odds_for_main_combat_loop (Fighter * this, int edx, Unit * att
 		return 1025;
 
 	struct c3x_config * cfg = &is->current_config;
-	// Only OR in counter-rule terrain skipping when we actually ran apply_counter_rules for this
-	// call. Otherwise counter_combat_ctx.ignore_terrain can be stale from an earlier combat
-	// round or a future odds probe.
-	bool ignore_terrain_for_odds = ignore_defensive_bonuses;
+	// Only OR in counter-rule defensive bonus skipping when we actually ran apply_counter_rules
+	// for this call. Otherwise counter_combat_ctx.ignore_terrain can be stale from an earlier
+	// combat round or a future odds probe.
+	bool ignore_terrain = false;
 	if (cfg->enable_unit_counters && attacker != NULL && defender != NULL) {
 		Tile * def_tile = tile_at (this->defender_location_x,
 		                           this->defender_location_y);
 		int  aa, dd;
-		bool ignore_terrain;
 		apply_counter_rules (cfg, attacker, defender, def_tile,
 		                     &aa, &dd, &ignore_terrain);
 
@@ -29026,11 +29027,11 @@ patch_Fighter_get_odds_for_main_combat_loop (Fighter * this, int edx, Unit * att
 		is->counter_combat_ctx.attacker_atk_pct = aa;
 		is->counter_combat_ctx.defender_def_pct = dd;
 		is->counter_combat_ctx.ignore_terrain  = ignore_terrain;
-		ignore_terrain_for_odds = ignore_defensive_bonuses || ignore_terrain;
 	}
 
-	int result = Fighter_get_combat_odds (this, __, attacker, defender, bombarding,
-	                                      ignore_terrain_for_odds);
+	int result = Fighter_get_combat_odds (
+		this, __, attacker, defender, bombarding,
+		ignore_defensive_bonuses || ignore_terrain);
 	is->counter_combat_ctx.active = false;
 	return result;
 }
@@ -29778,32 +29779,87 @@ format_combat_odds_hud_text (char * out,
 }
 
 double
+calc_attacker_combat_win_chance_from_round_chance (double round_win_chance,
+                                                   int attacker_hp,
+                                                   int defender_hp)
+{
+	if (round_win_chance <= 0.0)
+		return 0.0;
+	if (round_win_chance >= 1.0)
+		return 1.0;
+	if (attacker_hp <= 0)
+		return 0.0;
+	if (defender_hp <= 0)
+		return 1.0;
+
+	double round_loss_chance = 1.0 - round_win_chance;
+	double term = 1.0;
+	for (int i = 0; i < defender_hp; i++)
+		term *= round_win_chance;
+
+	double result = 0.0;
+	for (int attacker_losses = 0; attacker_losses < attacker_hp; attacker_losses++) {
+		result += term;
+		term *= ((double)(defender_hp + attacker_losses) /
+		         (double)(attacker_losses + 1)) *
+		        round_loss_chance;
+	}
+	return result;
+}
+
+double
+attacker_round_win_chance_from_fighter_odds (int odds)
+{
+	if (odds <= 0)
+		return 1.0;
+	if (odds >= 1024)
+		return 0.0;
+	return 1.0 - ((double)odds / 1024.0);
+}
+
+bool
+set_fighter_context_for_combat_odds_hud (Fighter * fighter,
+                                         Unit * attacker,
+                                         Unit * defender,
+                                         int defender_x,
+                                         int defender_y)
+{
+	int attack_direction = Map_compute_neighbor_index (
+		&p_bic_data->Map, __, attacker->Body.X, attacker->Body.Y,
+		defender_x, defender_y, 8);
+	if ((attack_direction <= 0) || (attack_direction > 8))
+		return false;
+
+	fighter->attacker = attacker;
+	fighter->defender = defender;
+	fighter->attack_direction = attack_direction;
+	fighter->defense_direction = reverse_dir ((enum direction)attack_direction);
+	fighter->attacker_location_x = attacker->Body.X;
+	fighter->attacker_location_y = attacker->Body.Y;
+	fighter->defender_location_x = defender_x;
+	fighter->defender_location_y = defender_y;
+	return true;
+}
+
+double
 calc_attacker_win_chance_for_hud (Unit * attacker, Unit * defender,
                                   int defender_x, int defender_y)
 {
 	Fighter saved_fighter = p_bic_data->fighter;
+	if (! set_fighter_context_for_combat_odds_hud (
+		    &p_bic_data->fighter, attacker, defender,
+		    defender_x, defender_y))
+		return 0.0;
 
-	p_bic_data->fighter.attacker = attacker;
-	p_bic_data->fighter.defender = defender;
-	p_bic_data->fighter.attacker_location_x = attacker->Body.X;
-	p_bic_data->fighter.attacker_location_y = attacker->Body.Y;
-	p_bic_data->fighter.defender_location_x = defender_x;
-	p_bic_data->fighter.defender_location_y = defender_y;
-
-	Unit * effective_attacker = counter_attacker_for_defender_selection (attacker, defender);
-	int attacker_atk_pct = 100,
-	    defender_def_pct = 100;
-	get_counter_rule_combat_modifiers (
-		effective_attacker, defender,
-		&attacker_atk_pct, &defender_def_pct);
-
-	double defender_win_chance = calc_defender_win_chance (
-		effective_attacker, defender,
-		Unit_get_defense_strength (defender),
-		attacker_atk_pct, defender_def_pct);
+	int odds = patch_Fighter_get_odds_for_main_combat_loop (
+		&p_bic_data->fighter, __, attacker, defender, false, false);
+	double round_win_chance = attacker_round_win_chance_from_fighter_odds (odds);
 
 	p_bic_data->fighter = saved_fighter;
-	return 1.0 - defender_win_chance;
+	is->counter_combat_ctx.active = false;
+	return calc_attacker_combat_win_chance_from_round_chance (
+		round_win_chance, unit_current_hp (attacker),
+		unit_current_hp (defender));
 }
 
 double
@@ -29826,6 +29882,86 @@ calc_bombard_round_damage_chance_for_hud (Unit * attacker, Unit * target,
 }
 
 bool
+is_attack_hud_move_validity_attackable (AdjacentMoveValidity validity)
+{
+	return (validity == AMV_OK) ||
+	       (validity == AMV_TRIGGERS_WAR);
+}
+
+Unit *
+find_visible_defender_for_attack_hud (Main_Screen_Form * main_screen_form,
+                                      Unit * attacker,
+                                      Tile * tile,
+                                      int tile_x,
+                                      int tile_y)
+{
+	Unit * best = NULL;
+	double best_attacker_win_chance = 2.0;
+	int best_hp = -1,
+	    best_cost = -1;
+
+	FOR_UNITS_ON (uti, tile) {
+		Unit * unit = uti.unit;
+		if (! (unit_has_valid_type_id (unit) &&
+		       (unit->Body.Container_Unit < 0) &&
+		       (unit->Body.CivID != attacker->Body.CivID) &&
+		       unit->vtable->is_enemy_of_civ (unit, __, attacker->Body.CivID, 0) &&
+		       patch_Unit_is_visible_to_civ (unit, __, attacker->Body.CivID, 0) &&
+		       (Unit_get_defense_strength (unit) > 0)))
+			continue;
+
+		Fighter saved_fighter = p_bic_data->fighter;
+		bool can_defend =
+			set_fighter_context_for_combat_odds_hud (
+				&p_bic_data->fighter, attacker, unit,
+				tile_x, tile_y) &&
+			Fighter_unit_can_defend (
+				&p_bic_data->fighter, __, unit, tile_x, tile_y);
+
+		p_bic_data->fighter = saved_fighter;
+		if (! can_defend)
+			continue;
+
+		double attacker_win_chance = calc_attacker_win_chance_for_hud (
+			attacker, unit, tile_x, tile_y);
+		int hp = unit_current_hp (unit),
+		    cost = p_bic_data->UnitTypes[unit->Body.UnitTypeID].Cost;
+		if ((best == NULL) ||
+		    (attacker_win_chance < best_attacker_win_chance) ||
+		    ((attacker_win_chance == best_attacker_win_chance) &&
+		     ((hp > best_hp) ||
+		      ((hp == best_hp) && (cost > best_cost))))) {
+			best = unit;
+			best_attacker_win_chance = attacker_win_chance;
+			best_hp = hp;
+			best_cost = cost;
+		}
+	}
+	if (best != NULL)
+		return best;
+
+	Unit * defender = Main_Screen_Form_find_visible_unit (
+		main_screen_form, __, tile_x, tile_y, NULL);
+	if (! (unit_has_valid_type_id (defender) &&
+	       (defender->Body.CivID != attacker->Body.CivID) &&
+	       defender->vtable->is_enemy_of_civ (defender, __, attacker->Body.CivID, 0) &&
+	       patch_Unit_is_visible_to_civ (defender, __, attacker->Body.CivID, 0) &&
+	       (Unit_get_defense_strength (defender) > 0)))
+		return NULL;
+
+	Fighter saved_fighter = p_bic_data->fighter;
+	bool can_defend =
+		set_fighter_context_for_combat_odds_hud (
+			&p_bic_data->fighter, attacker, defender,
+			tile_x, tile_y) &&
+		Fighter_unit_can_defend (
+			&p_bic_data->fighter, __, defender, tile_x, tile_y);
+
+	p_bic_data->fighter = saved_fighter;
+	return can_defend ? defender : NULL;
+}
+
+bool
 build_attack_combat_odds_hud_state (Main_Screen_Form * main_screen_form,
                                     Unit * attacker,
                                     int tile_x,
@@ -29839,12 +29975,17 @@ build_attack_combat_odds_hud_state (Main_Screen_Form * main_screen_form,
 		attacker->Body.X, attacker->Body.Y, tile_x, tile_y, 8);
 	if ((neighbor_index <= 0) || (neighbor_index > 8))
 		return false;
-	if (patch_Unit_can_move_to_adjacent_tile (attacker, __, neighbor_index, 0) != AMV_OK)
+	AdjacentMoveValidity move_validity = patch_Unit_can_move_to_adjacent_tile (
+		attacker, __, neighbor_index, 0);
+	if (! is_attack_hud_move_validity_attackable (move_validity))
 		return false;
 
 	Tile * tile = tile_at (tile_x, tile_y);
-	Unit * defender = find_counter_best_visible_defender_against (
-		attacker, tile, tile_x, tile_y, NULL);
+	if ((tile == NULL) || (tile == p_null_tile))
+		return false;
+
+	Unit * defender = find_visible_defender_for_attack_hud (
+		main_screen_form, attacker, tile, tile_x, tile_y);
 	if (! unit_has_valid_type_id (defender))
 		return false;
 
