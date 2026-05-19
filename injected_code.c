@@ -8054,7 +8054,7 @@ bool
 is_counter_rule_option_token (struct string_slice const * token)
 {
 	return slice_matches_str (token, "in-city") ||
-	       slice_matches_str (token, "ignore-terrain") ||
+	       slice_matches_str (token, "ignore-defensive-bonuses") ||
 	       slice_matches_str (token, "self-atk") ||
 	       slice_matches_str (token, "self-def") ||
 	       slice_matches_str (token, "enemy-atk") ||
@@ -8236,8 +8236,8 @@ parse_counter_rule (char ** p_cursor,
 	while (parse_string (&cur, &token)) {
 		if (slice_matches_str (&token, "in-city")) {
 			r->only_in_city = true;
-		} else if (slice_matches_str (&token, "ignore-terrain")) {
-			r->ignore_terrain = true;
+		} else if (slice_matches_str (&token, "ignore-defensive-bonuses")) {
+			r->ignore_defensive_bonuses = true;
 		} else if (slice_matches_str (&token, "self-atk")) {
 			if (! parse_int (&cur, &r->self_atk_pct))
 				return RPR_PARSE_ERROR;
@@ -8320,13 +8320,13 @@ void
 apply_counter_rules (struct c3x_config * cfg,
                      Unit * attacker, Unit * defender, Tile * def_tile,
                      int * out_attacker_atk, int * out_defender_def,
-                     bool * out_ignore_terrain)
+                     bool * out_ignore_defensive_bonuses)
 {
 	int a_type   = attacker->Body.UnitTypeID;
 	int d_type   = defender->Body.UnitTypeID;
 
 	int aa = 100, dd = 100;
-	bool ignore = false;
+	bool ignore_defensive_bonuses = false;
 
 	for (int i = 0; i < cfg->count_counter_rules; i++) {
 		struct counter_rule * r = &cfg->counter_rules[i];
@@ -8368,9 +8368,9 @@ apply_counter_rules (struct c3x_config * cfg,
 
 		if (forward) {
 			aa = aa * r->self_atk_pct  / 100;  // self-atk: attacker attack
-			if (r->ignore_terrain) {
-				// ignore-terrain replaces this rule's enemy-def effect.
-				ignore = true;
+			if (r->ignore_defensive_bonuses) {
+				// ignore-defensive-bonuses replaces this rule's enemy-def effect.
+				ignore_defensive_bonuses = true;
 			} else
 				dd = dd * r->enemy_def_pct / 100;  // enemy-def: defender defense
 		}
@@ -8382,7 +8382,7 @@ apply_counter_rules (struct c3x_config * cfg,
 
 	*out_attacker_atk  = aa;
 	*out_defender_def  = dd;
-	*out_ignore_terrain = ignore;
+	*out_ignore_defensive_bonuses = ignore_defensive_bonuses;
 }
 
 int
@@ -29011,27 +29011,28 @@ patch_Fighter_get_odds_for_main_combat_loop (Fighter * this, int edx, Unit * att
 
 	struct c3x_config * cfg = &is->current_config;
 	// Only OR in counter-rule defensive bonus skipping when we actually ran apply_counter_rules
-	// for this call. Otherwise counter_combat_ctx.ignore_terrain can be stale from an earlier
-	// combat round or a future odds probe.
-	bool ignore_terrain = false;
+	// for this call. Otherwise counter_combat_ctx.ignore_defensive_bonuses can be stale from an
+	// earlier combat round or a future odds probe.
+	bool counter_ignore_defensive_bonuses = false;
 	if (cfg->enable_unit_counters && attacker != NULL && defender != NULL) {
 		Tile * def_tile = tile_at (this->defender_location_x,
 		                           this->defender_location_y);
 		int  aa, dd;
 		apply_counter_rules (cfg, attacker, defender, def_tile,
-		                     &aa, &dd, &ignore_terrain);
+		                     &aa, &dd, &counter_ignore_defensive_bonuses);
 
 		is->counter_combat_ctx.active          = true;
 		is->counter_combat_ctx.attacker        = attacker;
 		is->counter_combat_ctx.defender        = defender;
 		is->counter_combat_ctx.attacker_atk_pct = aa;
 		is->counter_combat_ctx.defender_def_pct = dd;
-		is->counter_combat_ctx.ignore_terrain  = ignore_terrain;
+		is->counter_combat_ctx.ignore_defensive_bonuses =
+			counter_ignore_defensive_bonuses;
 	}
 
 	int result = Fighter_get_combat_odds (
 		this, __, attacker, defender, bombarding,
-		ignore_defensive_bonuses || ignore_terrain);
+		ignore_defensive_bonuses || counter_ignore_defensive_bonuses);
 	is->counter_combat_ctx.active = false;
 	return result;
 }
@@ -29057,9 +29058,10 @@ counter_adjusted_defender_strength (Unit * attacker, Unit * defender, int defend
 		return defender_strength;
 
 	int  attacker_atk_pct, defender_def_pct;
-	bool ignore_terrain;
+	bool ignore_defensive_bonuses;
 	apply_counter_rules (&is->current_config, attacker, defender, def_tile,
-	                     &attacker_atk_pct, &defender_def_pct, &ignore_terrain);
+	                     &attacker_atk_pct, &defender_def_pct,
+	                     &ignore_defensive_bonuses);
 
 	if ((attacker_atk_pct == 100) && (defender_def_pct == 100))
 		return defender_strength;
@@ -29088,9 +29090,10 @@ counter_adjusted_attacker_strength (Unit * attacker, Unit * defender, int attack
 		return attacker_strength;
 
 	int  attacker_atk_pct, defender_def_pct;
-	bool ignore_terrain;
+	bool ignore_defensive_bonuses;
 	apply_counter_rules (&is->current_config, attacker, defender, def_tile,
-	                     &attacker_atk_pct, &defender_def_pct, &ignore_terrain);
+	                     &attacker_atk_pct, &defender_def_pct,
+	                     &ignore_defensive_bonuses);
 
 	if ((attacker_atk_pct == 100) && (defender_def_pct == 100))
 		return attacker_strength;
@@ -29127,13 +29130,13 @@ get_counter_rule_combat_modifiers (Unit * attacker, Unit * defender,
 	if ((def_tile == NULL) || (def_tile == p_null_tile))
 		return false;
 
-	bool ignore_terrain;
+	bool ignore_defensive_bonuses;
 	apply_counter_rules (&is->current_config, attacker, defender, def_tile,
 	                     out_attacker_atk_pct, out_defender_def_pct,
-	                     &ignore_terrain);
+	                     &ignore_defensive_bonuses);
 	return (*out_attacker_atk_pct != 100) ||
 	       (*out_defender_def_pct != 100) ||
-	       ignore_terrain;
+	       ignore_defensive_bonuses;
 }
 
 double
@@ -29341,14 +29344,14 @@ find_counter_best_defender_against (Unit * attacker, Tile * tile, int tile_x,
 
 		if (out_any_counter_effect != NULL) {
 			int attacker_atk_pct, defender_def_pct;
-			bool ignore_terrain;
+			bool ignore_defensive_bonuses;
 			apply_counter_rules (
 				&is->current_config, attacker, unit, tile,
 				&attacker_atk_pct, &defender_def_pct,
-				&ignore_terrain);
+				&ignore_defensive_bonuses);
 			if ((attacker_atk_pct != 100) ||
 			    (defender_def_pct != 100) ||
-			    ignore_terrain)
+			    ignore_defensive_bonuses)
 				*out_any_counter_effect = true;
 		}
 
