@@ -634,6 +634,145 @@ get_city_screen_center_y (City * city)
 		return y + 2; // base game behavior
 }
 
+#define BASE_SCREEN_WIDTH 1024
+#define BASE_SCREEN_HEIGHT 768
+
+struct adaptive_ui_layout {
+	int left, top, width, height;
+	int scale_num, scale_den;
+};
+
+static int
+screen_width_or_base ()
+{
+	return (p_bic_data->ScreenWidth > 0) ? p_bic_data->ScreenWidth : BASE_SCREEN_WIDTH;
+}
+
+static int
+screen_height_or_base ()
+{
+	return (p_bic_data->ScreenHeight > 0) ? p_bic_data->ScreenHeight : BASE_SCREEN_HEIGHT;
+}
+
+static int
+scale_layout_value (int val, int num, int den)
+{
+	if (den <= 0)
+		return val;
+	return (val * num + den / 2) / den;
+}
+
+static struct adaptive_ui_layout
+get_adaptive_ui_layout ()
+{
+	int screen_w = screen_width_or_base (),
+	    screen_h = screen_height_or_base ();
+
+	struct adaptive_ui_layout tr = {
+		.left = (screen_w - BASE_SCREEN_WIDTH) / 2,
+		.top = (screen_h - BASE_SCREEN_HEIGHT) / 2,
+		.width = BASE_SCREEN_WIDTH,
+		.height = BASE_SCREEN_HEIGHT,
+		.scale_num = 1,
+		.scale_den = 1
+	};
+
+	if (! is->current_config.adaptive_resolution_ui_scaling)
+		return tr;
+
+	if (screen_w * BASE_SCREEN_HEIGHT <= screen_h * BASE_SCREEN_WIDTH) {
+		tr.scale_num = screen_w;
+		tr.scale_den = BASE_SCREEN_WIDTH;
+	} else {
+		tr.scale_num = screen_h;
+		tr.scale_den = BASE_SCREEN_HEIGHT;
+	}
+
+	tr.width = scale_layout_value (BASE_SCREEN_WIDTH, tr.scale_num, tr.scale_den);
+	tr.height = scale_layout_value (BASE_SCREEN_HEIGHT, tr.scale_num, tr.scale_den);
+	tr.left = (screen_w - tr.width) / 2;
+	tr.top = (screen_h - tr.height) / 2;
+	return tr;
+}
+
+static int
+base_ui_to_screen_x (int x)
+{
+	struct adaptive_ui_layout layout = get_adaptive_ui_layout ();
+	return layout.left + scale_layout_value (x, layout.scale_num, layout.scale_den);
+}
+
+static int
+base_ui_to_screen_y (int y)
+{
+	struct adaptive_ui_layout layout = get_adaptive_ui_layout ();
+	return layout.top + scale_layout_value (y, layout.scale_num, layout.scale_den);
+}
+
+static int
+base_ui_to_screen_size (int size)
+{
+	struct adaptive_ui_layout layout = get_adaptive_ui_layout ();
+	return scale_layout_value (size, layout.scale_num, layout.scale_den);
+}
+
+static int
+screen_to_base_ui_x (int x)
+{
+	struct adaptive_ui_layout layout = get_adaptive_ui_layout ();
+	if (layout.scale_num <= 0)
+		return x - layout.left;
+	return ((x - layout.left) * layout.scale_den + layout.scale_num / 2) / layout.scale_num;
+}
+
+static int
+screen_to_base_ui_y (int y)
+{
+	struct adaptive_ui_layout layout = get_adaptive_ui_layout ();
+	if (layout.scale_num <= 0)
+		return y - layout.top;
+	return ((y - layout.top) * layout.scale_den + layout.scale_num / 2) / layout.scale_num;
+}
+
+static void
+get_city_map_viewport (City_Form * city_form, RECT * out)
+{
+	int left_margin = (screen_width_or_base ()  - city_form->Background_Image.Width)  / 2,
+	    top_margin  = (screen_height_or_base () - city_form->Background_Image.Height) / 2;
+
+	out->left = left_margin;
+	out->top = top_margin + 92;
+	out->right = left_margin + 1024;
+	out->bottom = top_margin + 508;
+
+	if (is->current_config.adaptive_resolution_map_view) {
+		out->left = 0;
+		out->right = screen_width_or_base ();
+	}
+}
+
+static int
+get_adaptive_map_tile_margin ()
+{
+	if (! is->current_config.adaptive_resolution_map_view)
+		return 0;
+
+	int extra_w = screen_width_or_base () - BASE_SCREEN_WIDTH,
+	    extra_h = screen_height_or_base () - BASE_SCREEN_HEIGHT;
+	if (extra_w < 0)
+		extra_w = 0;
+	if (extra_h < 0)
+		extra_h = 0;
+	if ((extra_w == 0) && (extra_h == 0))
+		return 0;
+
+	int tile_half_w = p_bic_data->is_zoomed_out ? 32 : 64,
+	    tile_half_h = p_bic_data->is_zoomed_out ? 16 : 32;
+	int margin_x = (extra_w + tile_half_w - 1) / tile_half_w,
+	    margin_y = (extra_h + tile_half_h - 1) / tile_half_h;
+	return 4 + ((margin_x > margin_y) ? margin_x : margin_y);
+}
+
 void __fastcall
 patch_Main_Screen_Form_bring_cnter_view_city_focus (Main_Screen_Form * this, int edx, int x, int y, int param_3, bool always_update_tile_bounds, bool param_5)
 {
@@ -18622,6 +18761,8 @@ patch_init_floating_point ()
 		{"convert_some_popups_into_online_mp_messages"           , false, offsetof (struct c3x_config, convert_some_popups_into_online_mp_messages)},
 		{"enable_debug_mode_switch"                              , false, offsetof (struct c3x_config, enable_debug_mode_switch)},
 		{"accentuate_cities_on_minimap"                          , false, offsetof (struct c3x_config, accentuate_cities_on_minimap)},
+		{"adaptive_resolution_map_view"                          , true , offsetof (struct c3x_config, adaptive_resolution_map_view)},
+		{"adaptive_resolution_ui_scaling"                         , true , offsetof (struct c3x_config, adaptive_resolution_ui_scaling)},
 		{"allow_multipage_civilopedia_descriptions"              , true , offsetof (struct c3x_config, allow_multipage_civilopedia_descriptions)},
 		{"reformat_turns_remaining_on_domestic_advisor_screen"   , true , offsetof (struct c3x_config, reformat_turns_remaining_on_domestic_advisor_screen)},
 		{"expand_civilopedia_unit_stats"                         , true , offsetof (struct c3x_config, expand_civilopedia_unit_stats)},
@@ -25040,9 +25181,9 @@ patch_Parameters_Form_m68_Show_Dialog (Parameters_Form * this, int edx, int para
 		Button_initialize (b, __,
 				   is->c3x_labels[CL_MOD_INFO_BUTTON_TEXT], // text
 				   MOD_INFO_BUTTON_ID, // control ID
-				   (p_bic_data->ScreenWidth - 1024) / 2 + 891, // location x
-				   (p_bic_data->ScreenHeight - 768) / 2 + 31,  // location y
-				   MOD_INFO_BUTTON_WIDTH, MOD_INFO_BUTTON_HEIGHT, // width, height
+				   base_ui_to_screen_x (891), // location x
+				   base_ui_to_screen_y (31),  // location y
+				   base_ui_to_screen_size (MOD_INFO_BUTTON_WIDTH), base_ui_to_screen_size (MOD_INFO_BUTTON_HEIGHT), // width, height
 				   (Base_Form *)this, // parent
 				   0); // ?
 
@@ -26109,7 +26250,26 @@ patch_Map_Renderer_m71_Draw_Tiles (Map_Renderer * this, int edx, int param_1, in
 		is->saved_tile_count = -1;
 	}
 
+	int old_tile_x_min = p_main_screen_form->TileX_Min,
+	    old_tile_x_max = p_main_screen_form->TileX_Max,
+	    old_tile_y_min = p_main_screen_form->TileY_Min,
+	    old_tile_y_max = p_main_screen_form->TileY_Max;
+	int tile_margin = get_adaptive_map_tile_margin ();
+	if (tile_margin > 0) {
+		p_main_screen_form->TileX_Min -= tile_margin;
+		p_main_screen_form->TileX_Max += tile_margin;
+		p_main_screen_form->TileY_Min -= tile_margin;
+		p_main_screen_form->TileY_Max += tile_margin;
+	}
+
 	Map_Renderer_m71_Draw_Tiles (this, __, param_1, param_2, param_3);
+
+	if (tile_margin > 0) {
+		p_main_screen_form->TileX_Min = old_tile_x_min;
+		p_main_screen_form->TileX_Max = old_tile_x_max;
+		p_main_screen_form->TileY_Min = old_tile_y_min;
+		p_main_screen_form->TileY_Max = old_tile_y_max;
+	}
 }
 
 struct named_tile_entry *
@@ -33724,9 +33884,8 @@ patch_Main_Screen_Form_t2s_coords_to_draw_yields (Main_Screen_Form * this, int e
 void
 set_clip_area_to_map_view (City_Form * city_form)
 {
-	int left_margin = (p_bic_data->ScreenWidth  - city_form->Background_Image.Width)  / 2,
-	    top_margin  = (p_bic_data->ScreenHeight - city_form->Background_Image.Height) / 2;
-	RECT map_view_on_screen = { .left = left_margin, .top = top_margin + 92, .right = left_margin + 1024, .bottom = top_margin + 508 };
+	RECT map_view_on_screen;
+	get_city_map_viewport (city_form, &map_view_on_screen);
 	JGL_Image * jgl_canvas = city_form->Base.Data.Canvas.JGL.Image;
 	jgl_canvas->vtable->m13_Set_Clip_Region (jgl_canvas, __, &map_view_on_screen);
 }

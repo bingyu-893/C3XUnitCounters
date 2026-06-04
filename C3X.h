@@ -345,6 +345,8 @@ struct c3x_config {
 	bool enable_debug_mode_switch;
 	bool accentuate_cities_on_minimap;
 	enum minimap_doubling_mode double_minimap_size;
+	bool adaptive_resolution_map_view;
+	bool adaptive_resolution_ui_scaling;
 	bool allow_multipage_civilopedia_descriptions;
 	enum unit_cycle_search_criteria unit_cycle_search_criteria;
 	bool reformat_turns_remaining_on_domestic_advisor_screen;
