@@ -229,6 +229,8 @@ bool __fastcall patch_Leader_can_build_city_improvement (Leader * this, int edx,
 char __fastcall patch_Leader_can_do_worker_job (Leader * this, int edx, enum Worker_Jobs job, int tile_x, int tile_y, int ask_if_replacing);
 void __fastcall patch_Unit_despawn (Unit * this, int edx, int civ_id_responsible, byte param_2, byte param_3, byte param_4, byte param_5, byte param_6, byte param_7);
 int __fastcall patch_Unit_move_to_adjacent_tile (Unit * this, int edx, int neighbor_index, bool param_2, int param_3, byte param_4);
+void __fastcall patch_Unit_start_science_age (Unit * this);
+Unit * __fastcall patch_Leader_spawn_unit (Leader * this, int edx, int type_id, int tile_x, int tile_y, int barb_tribe_id, int id, bool param_6, LeaderKind leader_kind, int race_id);
 bool can_build_district_on_tile (Tile * tile, int district_id, int civ_id);
 bool city_can_build_district (City * city, int district_id);
 bool leader_can_build_district (Leader * leader, int district_id);
@@ -3506,8 +3508,28 @@ patch_Unit_get_max_move_points_for_bridge_exit (Unit * this)
 		return patch_Unit_get_max_move_points (this);
 }
 
-// This func implements GA remaining turns indicator. It intercepts a call to some kind of text processing function when it's called to process the
-// text in the lower right (containing current research, GA status, & mobilization) and splices in the number of remaining GA turns if in a GA.
+bool
+add_turn_count_to_status_label (char * str, unsigned str_size, char const * label, int turns_left)
+{
+	if ((str == NULL) || (str_size == 0) || (label == NULL) || (*label == '\0'))
+		return false;
+
+	char * label_start = strstr (str, label);
+	char s[4096];
+	if (label_start != NULL) {
+		char const * label_end = label_start + strlen (label);
+		snprintf (s, sizeof s, "%.*s (%d)%s", label_end - str, str, turns_left, label_end);
+	} else
+		return false;
+
+	s[(sizeof s) - 1] = '\0';
+	strncpy (str, s, str_size);
+	str[str_size - 1] = '\0';
+	return true;
+}
+
+// This func implements the GA remaining turns indicator. It intercepts a call to some kind of text processing function when it's called to process
+// the text in the lower right (containing current research, GA status, & mobilization) and splices in the number of remaining turns.
 int __fastcall
 patch_PCX_Image_process_tech_ga_status (PCX_Image * this, int edx, char * str)
 {
@@ -3515,17 +3537,35 @@ patch_PCX_Image_process_tech_ga_status (PCX_Image * this, int edx, char * str)
 	if (is->current_config.show_golden_age_turns_remaining &&
 	    (*p_current_turn_no < player->Golden_Age_End)) {
 		int turns_left = player->Golden_Age_End - *p_current_turn_no;
-		char const * ga_label = (*p_labels)[LBL_GOLDEN_AGE];
-		char const * ga_str_start = strstr (str, ga_label);
-		if (ga_str_start != NULL) {
-			char s[250];
-			char const * ga_str_end = ga_str_start + strlen (ga_label);
-			snprintf (s, sizeof s, "%.*s (%d)%s", ga_str_end - str, str, turns_left, ga_str_end);
-			s[(sizeof s) - 1] = '\0';
-			strncpy (str, s, sizeof s);
+		add_turn_count_to_status_label (str, sizeof_temp_str, (*p_labels)[LBL_GOLDEN_AGE], turns_left);
+	}
+
+	return PCX_Image_process_text (this, __, str);
+}
+
+int __cdecl
+patch_process_text_for_science_advisor (char * in, char * out)
+{
+	if (is->current_config.show_science_age_turns_remaining &&
+	    (p_main_screen_form != NULL) &&
+	    (p_current_turn_no != NULL)) {
+		int player_id = p_main_screen_form->Player_CivID;
+		if ((player_id >= 0) && (player_id < 32)) {
+			Leader * player = &leaders[player_id];
+			if (*p_current_turn_no < player->Science_Age_End) {
+				int turns_left = player->Science_Age_End - *p_current_turn_no;
+				char s[256];
+				char const * format = is->c3x_labels[CL_SCIENCE_AGE_TURNS_REMAINING];
+				if ((format == NULL) || (*format == '\0'))
+					format = "Our Age of Scientific Discovery should continue for about %d turns.";
+				snprintf (s, sizeof s, format, turns_left);
+				s[(sizeof s) - 1] = '\0';
+				return process_text_snippet (s, out);
+			}
 		}
 	}
-	return PCX_Image_process_text (this, __, str);
+
+	return process_text_snippet (in, out);
 }
 
 bool __fastcall
@@ -18534,6 +18574,7 @@ patch_init_floating_point ()
 		{"put_movement_icons_on_units_on_menu"                   , true , offsetof (struct c3x_config, put_movement_icons_on_units_on_menu)},
 		{"describe_states_of_units_on_menu"                      , true , offsetof (struct c3x_config, describe_states_of_units_on_menu)},
 		{"show_golden_age_turns_remaining"                       , true , offsetof (struct c3x_config, show_golden_age_turns_remaining)},
+		{"show_science_age_turns_remaining"                      , true , offsetof (struct c3x_config, show_science_age_turns_remaining)},
 		{"show_zoc_attacks_from_mid_stack"                       , true , offsetof (struct c3x_config, show_zoc_attacks_from_mid_stack)},
 		{"show_armies_performing_defensive_bombard"              , true , offsetof (struct c3x_config, show_armies_performing_defensive_bombard)},
 		{"cut_research_spending_to_avoid_bankruptcy"             , true , offsetof (struct c3x_config, cut_research_spending_to_avoid_bankruptcy)},
@@ -18707,6 +18748,10 @@ patch_init_floating_point ()
 		{"anarchy_length_percent"                            ,   100,  offsetof (struct c3x_config, anarchy_length_percent)},
 		{"ai_multi_city_start"                               ,     0,  offsetof (struct c3x_config, ai_multi_city_start)},
 		{"max_tries_to_place_fp_city"                        , 10000,  offsetof (struct c3x_config, max_tries_to_place_fp_city)},
+		{"scientific_leader_chance_percent"                  ,     3,  offsetof (struct c3x_config, scientific_leader_chance_percent)},
+		{"scientific_trait_scientific_leader_chance_percent" ,     5,  offsetof (struct c3x_config, scientific_trait_scientific_leader_chance_percent)},
+		{"science_age_duration_turns"                        ,    20,  offsetof (struct c3x_config, science_age_duration_turns)},
+		{"science_age_research_multiplier_percent"           ,   125,  offsetof (struct c3x_config, science_age_research_multiplier_percent)},
 		{"ai_research_multiplier"                            ,   100,  offsetof (struct c3x_config, ai_research_multiplier)},
 		{"ai_settler_perfume_on_founding_duration"           ,     0,  offsetof (struct c3x_config, ai_settler_perfume_on_founding_duration)},
 		{"extra_unit_maintenance_per_shields"                ,     0,  offsetof (struct c3x_config, extra_unit_maintenance_per_shields)},
@@ -18886,6 +18931,10 @@ patch_init_floating_point ()
 	is->trade_scroll_button_images = NULL;
 	is->trade_scroll_button_state = IS_UNINITED;
 	is->eligible_for_trade_scroll = 0;
+
+	is->scientific_leader_spawn_base_chance = 0;
+	is->scientific_leader_spawn_target_chance = 0;
+	is->scientific_leader_spawn_adjustment_active = 0;
 
 	memset (&is->saved_code_areas, 0, sizeof is->saved_code_areas);
 
@@ -22822,6 +22871,65 @@ any_enemies_near_unit (Unit * unit, int num_tiles)
 	return any_enemies_near (&leaders[unit->Body.CivID], unit->Body.X, unit->Body.Y, unit_type->Unit_Class, num_tiles);
 }
 
+bool
+leader_has_scientific_trait (Leader * leader)
+{
+	if ((leader == NULL) ||
+	    (leader->RaceID < 0) ||
+	    (leader->RaceID >= p_bic_data->RacesCount))
+		return false;
+
+	Race * race = &p_bic_data->Races[leader->RaceID];
+	return (race->Bonuses & RBF_Scientific) != 0;
+}
+
+int
+base_scientific_leader_chance (Leader * leader)
+{
+	return leader_has_scientific_trait (leader) ? 5 : 3;
+}
+
+int
+target_scientific_leader_chance (Leader * leader)
+{
+	int chance = leader_has_scientific_trait (leader) ?
+		is->current_config.scientific_trait_scientific_leader_chance_percent :
+		is->current_config.scientific_leader_chance_percent;
+	return clamp (0, 100, chance);
+}
+
+int __fastcall
+patch_rand_int_for_scientific_leader (void * this, int edx, int lim)
+{
+	if (is->scientific_leader_spawn_adjustment_active && (lim == 100)) {
+		int base = is->scientific_leader_spawn_base_chance,
+		    target = is->scientific_leader_spawn_target_chance;
+
+		if (target <= 0)
+			return base;
+		else if (target >= 100)
+			return 0;
+		else
+			return (rand_int (this, __, 100) < target) ? 0 : base;
+	}
+
+	return rand_int (this, __, lim);
+}
+
+void __fastcall
+patch_Unit_start_science_age (Unit * this)
+{
+	int civ_id = (this != NULL) ? this->Body.CivID : -1;
+	Unit_start_science_age (this);
+
+	int duration = is->current_config.science_age_duration_turns;
+	if ((duration >= 0) &&
+	    (civ_id >= 0) &&
+	    (civ_id < 32) &&
+	    (leaders[civ_id].Science_Age_End > *p_current_turn_no))
+		leaders[civ_id].Science_Age_End = *p_current_turn_no + duration;
+}
+
 void __fastcall
 patch_Unit_ai_move_artillery (Unit * this)
 {
@@ -23005,7 +23113,7 @@ patch_Unit_ai_move_leader (Unit * this)
 	// Start a science age if we can
 	// It would be nice to compute a value for this and compare it to the option of rushing production but it's hard to come up with a valuation
 	if (is->current_config.patch_science_age_bug && Unit_ai_can_start_science_age (this)) {
-		Unit_start_science_age (this);
+		patch_Unit_start_science_age (this);
 		return;
 	}
 
@@ -26786,12 +26894,26 @@ patch_City_get_net_commerce (City * this, int edx, int kind, bool include_scienc
 {
 	int base = City_get_net_commerce (this, __, kind, include_science_age);
 
-	if ((kind == 1) && // beakers, as opposed to 2 which is gold
-	    (is->current_config.ai_research_multiplier != 100) &&
-	    ((*p_human_player_bits & 1<<this->Body.CivID) == 0))
-		return (base * is->current_config.ai_research_multiplier + 50) / 100;
-	else
-		return base;
+	if (kind == 1) { // beakers, as opposed to 2 which is gold
+		int civ_id = this->Body.CivID;
+		if (include_science_age &&
+		    (civ_id >= 0) &&
+		    (civ_id < 32) &&
+		    (*p_current_turn_no < leaders[civ_id].Science_Age_End) &&
+		    (is->current_config.science_age_research_multiplier_percent != 125)) {
+			int without_science_age = City_get_net_commerce (this, __, kind, false);
+			int multiplier = not_below (0, is->current_config.science_age_research_multiplier_percent);
+			base = (without_science_age * multiplier + 50) / 100;
+		}
+
+		if ((civ_id >= 0) &&
+		    (civ_id < 32) &&
+		    (is->current_config.ai_research_multiplier != 100) &&
+		    ((*p_human_player_bits & 1<<civ_id) == 0))
+			base = (base * is->current_config.ai_research_multiplier + 50) / 100;
+	}
+
+	return base;
 }
 
 // Cuts research spending while total expenditures > treasury. Returns whether spending has been cut.
@@ -28239,12 +28361,34 @@ patch_Leader_unlock_technology (Leader * this, int edx, int tech_id, bool param_
 	int * p_stack = (int *)&tech_id;
 	int ret_addr = p_stack[-1];
 
+	int called_during_init =
+		(ret_addr == ADDR_UNLOCK_TECH_AT_INIT_1) ||
+		(ret_addr == ADDR_UNLOCK_TECH_AT_INIT_2) ||
+		(ret_addr == ADDR_UNLOCK_TECH_AT_INIT_3);
+	int adjust_scientific_leader_chance = 0;
+	int base_chance = base_scientific_leader_chance (this);
+	int target_chance = target_scientific_leader_chance (this);
+	if ((! called_during_init) && (base_chance != target_chance))
+		adjust_scientific_leader_chance = 1;
+
+	int saved_scientific_leader_spawn_base_chance = is->scientific_leader_spawn_base_chance;
+	int saved_scientific_leader_spawn_target_chance = is->scientific_leader_spawn_target_chance;
+	int saved_scientific_leader_spawn_adjustment_active = is->scientific_leader_spawn_adjustment_active;
+
+	if (adjust_scientific_leader_chance) {
+		is->scientific_leader_spawn_base_chance = base_chance;
+		is->scientific_leader_spawn_target_chance = target_chance;
+		is->scientific_leader_spawn_adjustment_active = 1;
+	}
+
 	Leader_unlock_technology (this, __, tech_id, param_2, param_3, param_4);
 
+	is->scientific_leader_spawn_base_chance = saved_scientific_leader_spawn_base_chance;
+	is->scientific_leader_spawn_target_chance = saved_scientific_leader_spawn_target_chance;
+	is->scientific_leader_spawn_adjustment_active = saved_scientific_leader_spawn_adjustment_active;
+
 	// If this method was not called during game initialization
-	if ((ret_addr != ADDR_UNLOCK_TECH_AT_INIT_1) &&
-	    (ret_addr != ADDR_UNLOCK_TECH_AT_INIT_2) &&
-	    (ret_addr != ADDR_UNLOCK_TECH_AT_INIT_3)) {
+	if (! called_during_init) {
 
 		// If this tech obsoletes some building and we're configured to fix the maintenance bug then recompute city maintenance.
 		if (is->current_config.patch_maintenance_persisting_for_obsolete_buildings) {

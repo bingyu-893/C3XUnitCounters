@@ -167,3 +167,6 @@ Militaristic
 Religious
 Scientific
 Seafaring
+
+; Shown on the science advisor while a scientific golden age is active.
+Our Age of Scientific Discovery should continue for about %d turns.

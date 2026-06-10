@@ -267,6 +267,7 @@ struct c3x_config {
 	bool describe_states_of_units_on_menu;
 	int anarchy_length_percent;
 	bool show_golden_age_turns_remaining;
+	bool show_science_age_turns_remaining;
 	bool show_zoc_attacks_from_mid_stack;
 	bool show_armies_performing_defensive_bombard;
 	bool cut_research_spending_to_avoid_bankruptcy;
@@ -310,6 +311,10 @@ struct c3x_config {
 	bool promote_wonder_decorruption_effect;
 	bool allow_military_leaders_to_hurry_wonders;
 	bool allow_multiple_battle_created_units_per_player;
+	int scientific_leader_chance_percent;
+	int scientific_trait_scientific_leader_chance_percent;
+	int science_age_duration_turns;
+	int science_age_research_multiplier_percent;
 	int ai_research_multiplier;
 	int ai_settler_perfume_on_founding;
 	int ai_settler_perfume_on_founding_duration;
@@ -700,6 +705,7 @@ enum c3x_label {
 	CL_RELIGIOUS,
 	CL_SCIENTIFIC,
 	CL_SEAFARING,
+	CL_SCIENCE_AGE_TURNS_REMAINING,
 
 	COUNT_C3X_LABELS
 };
@@ -1770,6 +1776,11 @@ struct injected_state {
 	int eligible_for_trade_scroll;
 
 	char ask_gold_default[32];
+
+	// Used while Leader::unlock_technology is running to adjust scientific leader spawn odds.
+	int scientific_leader_spawn_base_chance;
+	int scientific_leader_spawn_target_chance;
+	int scientific_leader_spawn_adjustment_active;
 
 	// Set in patch_ai_choose_production, used by the various bits of injected code that run during the AI production choosing process.
 	City * ai_considering_production_for_city;
