@@ -913,7 +913,8 @@ ENTRY_POINT ()
 		struct civ_prog_object const * obj = &civ_prog_objects[n];
 		if (obj->job == OJ_DEFINE) {
 			char val[1000];
-			snprintf (val, sizeof val, "((%s)%d)", obj->type, obj->addr);
+			int addr = obj->is_off ? 0 : obj->addr;
+			snprintf (val, sizeof val, "((%s)%d)", obj->type, addr);
 			val[(sizeof val) - 1] = '\0';
 			tcc__define_symbol (tcc, obj->name, val);
 		}
@@ -957,6 +958,10 @@ ENTRY_POINT ()
 
 		// Initialize inlead
 		if (obj->job == OJ_INLEAD) {
+			if (obj->is_off) {
+				tcc__define_symbol (tcc, obj->name, temp_format ("((%s)0)", obj->type));
+				continue;
+			}
 			ASSERT (i_next_free_inlead < inleads_capacity);
 			struct inlead * inlead = &inleads[i_next_free_inlead++];
 			int func_addr = obj->addr;
@@ -1078,8 +1083,9 @@ ENTRY_POINT ()
 	// Pass through prog objects after compiling to redirect control flow to patches
 	for (int n = 0; n < count_civ_prog_objects; n++) {
 		struct civ_prog_object const * obj = &civ_prog_objects[n];
-		if ((obj->job != OJ_IGNORE) &&
-		    ! ((obj->job == OJ_REPL_CALL) && (obj->addr == 0x0FF))) { // Special address 0x0FF ("OFF") ignores call repl on a per-exe basis
+		bool is_off = obj->is_off &&
+			((obj->job == OJ_REPL_CALL) || (obj->job == OJ_INLEAD) || (obj->job == OJ_DEFINE));
+		if ((obj->job != OJ_IGNORE) && ! is_off) { // Special address 0x0FF ("OFF") skips unsupported per-exe objects
 			ASSERT ((obj->addr != 0) || (0 == strcmp (obj->name, "exe_version_index")));
 
 			if (obj->job == OJ_INLEAD)

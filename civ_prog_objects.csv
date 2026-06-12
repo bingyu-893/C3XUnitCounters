@@ -1,6 +1,11 @@
 JOB,	   GOG ADDR,	STEAM ADDR,	PCG ADDR,	NAME,						TYPE
 define,	   0,  		1,    		2,  		"exe_version_index",				"int"
 define,    0x9C3508,	0x9E5D08,	0x9C34C8,	"p_bic_data",					"BIC *"
+define,    0x0FF,	0xCCDB7C,	0x0FF,		"p_graphsy_ptr",				"void **"
+define,    0x0FF,	0xCCF900,	0x0FF,		"p_engine_screen_pcx",			"PCX_Image *"
+define,    0x0FF,	0x749260,	0x0FF,		"p_is_in_main_menu",				"int *"
+define,    0x0FF,	0xCCFC68,	0x0FF,		"p_mouse_capture_form",			"Base_Form **"
+define,    0x0FF,	0xCCFBE4,	0x0FF,		"p_focused_form",				"Base_Form **"
 define,    0xA52E80,	0xA75680,	0xA52E40,	"p_units",					"Units *"
 define,    0xA52DD4,	0xA755D0,	0xA52D94,	"p_tile_units",					"TileUnits *"
 define,    0xA52E68,	0xA75668,	0xA52E28,	"p_cities",					"Cities *"
@@ -950,6 +955,12 @@ define,	   0x4D519C,	0x4DD953,	0x4D525C,	"ADDR_AIR_UNIT_CHECK_TO_DRAW_PEDIA_STAT
 define,	   0x1A8,	0x1A9,		0x1A8,		"LBL_BOMBARD_RANGE",				"int"
 define,	   0x437F20,	0x439AC0,	0x437FA0,	"Unit_get_transport_capacity",			"int (__fastcall *) (Unit * this)"
 inlead,	   0x5543B0,	0x55FB10,	0x554360,	"Main_GUI_get_unit_stat_str",			"void (__fastcall *) (Main_GUI * this, int edx, char * out_str, Unit * unit)"
+
+inlead,    0x0FF,	0x622320,	0x0FF,		"GUI_route_mouse_event",			"Base_Form * (__cdecl *) (int * px, int * py)"
+inlead,    0x0FF,	0x622830,	0x0FF,		"GUI_route_captured_mouse_event",		"Base_Form * (__fastcall *) (Base_Form * this, int edx, int x, int y)"
+inlead,    0x0FF,	0x61C2D0,	0x0FF,		"Base_Form_screen_to_local",			"void (__fastcall *) (Base_Form * this, int edx, int * px, int * py)"
+inlead,    0x0FF,	0x61BC30,	0x0FF,		"Base_Form_get_mouse_pos",			"void (__fastcall *) (Base_Form * this, int edx, int * px, int * py)"
+inlead,    0x0FF,	0x61E6D0,	0x0FF,		"GUI_update_screen",				"int (__cdecl *) (RECT * dirty_or_null)"
 
 ignore,	   0x5FC710,	0x0,		0x0,		"PCX_Image_create_and_init_jgl_image",		"int (__fastcall *) (PCX_Image * this, int edx, int width, int height, int bit_depth, int param_4, int param_5, int param_6)"
 ignore,	   0x5FCC50,	0x0,		0x0,		"PCX_Image_draw_region_to_location",		"void (__fastcall *) (PCX_Image * this, int edx, PCX_Image * canvas, int src_x, int src_y, int dest_x, int dest_y, int width, int height)"

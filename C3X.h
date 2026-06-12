@@ -1482,6 +1482,7 @@ struct injected_state {
 	HMODULE user32;
 	HMODULE msvcrt;
 	HMODULE msimg32;
+	HMODULE gdi32;
 
 	// Win32 API functions
 	WINBOOL (WINAPI * VirtualProtect) (LPVOID, SIZE_T, DWORD, PDWORD);
@@ -1503,6 +1504,17 @@ struct injected_state {
 
 	// Win32 funcs from Msimg32.dll
 	BOOL (WINAPI * TransparentBlt) (HDC, int, int, int, int, HDC, int, int, int, int, UINT);
+
+	// Win32 funcs from Gdi32.dll
+	HDC (WINAPI * CreateCompatibleDC) (HDC);
+	HBITMAP (WINAPI * CreateCompatibleBitmap) (HDC, int, int);
+	HGDIOBJ (WINAPI * SelectObject) (HDC, HGDIOBJ);
+	BOOL (WINAPI * DeleteObject) (HGDIOBJ);
+	BOOL (WINAPI * DeleteDC) (HDC);
+	BOOL (WINAPI * BitBlt) (HDC, int, int, int, int, HDC, int, int, DWORD);
+	BOOL (WINAPI * StretchBlt) (HDC, int, int, int, int, HDC, int, int, int, int, DWORD);
+	int (WINAPI * SetStretchBltMode) (HDC, int);
+	BOOL (WINAPI * PatBlt) (HDC, int, int, int, int, DWORD);
 
 	// C standard library functions
 	int (* snprintf) (char *, size_t, char const *, ...);
@@ -1745,6 +1757,16 @@ struct injected_state {
 	// ==========
 	// } These fields are temporary/situational {
 	// ==========
+
+	HDC adaptive_ui_cache_dc;
+	HBITMAP adaptive_ui_cache_bitmap;
+	HBITMAP adaptive_ui_cache_old_bitmap;
+	int adaptive_ui_cache_width;
+	int adaptive_ui_cache_height;
+	int adaptive_ui_coordinate_remap_depth;
+	int adaptive_ui_dialog_depth;
+	int adaptive_ui_present_depth;
+	void (__fastcall * adaptive_ui_original_present) (void * this, int edx, RECT * dirty_or_null);
 
 	int saved_road_movement_rate; // Valid when railroad movement limit is applied (limit_railroad_movement > 0) and BIC data has been loaded
 	int road_mp_cost; // The cost of moving one tile along a road, in MP. Valid after BIC data was loaded.
@@ -2370,6 +2392,7 @@ enum object_job {
 struct civ_prog_object {
 	enum object_job job;
 	int addr;
+	bool is_off;
 	char const * name;
 	char const * type;
 };

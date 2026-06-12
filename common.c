@@ -783,6 +783,12 @@ parse_civ_prog_object (char ** p_cursor, int addr_column, struct civ_prog_object
 	struct civ_prog_object tr;
 	if (read_object_job (&columns[0], &tr.job) &&
 	    read_int (&columns[addr_column], &tr.addr)) {
+		struct string_slice addr_text = trim_string_slice (&columns[addr_column], 0);
+		// Preserve the sentinel's spelling since decimal 255 is also a legitimate object value.
+		tr.is_off = (addr_text.len == 5) &&
+			(addr_text.str[0] == '0') && (addr_text.str[1] == 'x') && (addr_text.str[2] == '0') &&
+			((addr_text.str[3] == 'F') || (addr_text.str[3] == 'f')) &&
+			((addr_text.str[4] == 'F') || (addr_text.str[4] == 'f'));
 		tr.name = trim_and_extract_slice (&columns[4], 1);
 		tr.type = trim_and_extract_slice (&columns[5], 1);
 		*out = tr;

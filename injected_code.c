@@ -32,6 +32,15 @@ struct injected_state * is = ADDR_INJECTED_STATE;
 #define QueryPerformanceFrequency is->QueryPerformanceFrequency
 #define GetLocalTime is->GetLocalTime
 #define TransparentBlt is->TransparentBlt
+#define CreateCompatibleDC is->CreateCompatibleDC
+#define CreateCompatibleBitmap is->CreateCompatibleBitmap
+#define SelectObject is->SelectObject
+#define DeleteObject is->DeleteObject
+#define DeleteDC is->DeleteDC
+#define BitBlt is->BitBlt
+#define StretchBlt is->StretchBlt
+#define SetStretchBltMode is->SetStretchBltMode
+#define PatBlt is->PatBlt
 #define snprintf is->snprintf
 #define malloc is->malloc
 #define calloc is->calloc
@@ -717,21 +726,112 @@ base_ui_to_screen_size (int size)
 }
 
 static int
+screen_coord_to_base_canvas (int coord, int dest_offset, int dest_size, int source_offset, int source_size)
+{
+	if (dest_size <= 0)
+		return coord;
+
+	int tr = source_offset + ((coord - dest_offset) * source_size) / dest_size;
+	if (tr < source_offset)
+		tr = source_offset;
+	if (tr >= source_offset + source_size)
+		tr = source_offset + source_size - 1;
+	return tr;
+}
+
+static int
 screen_to_base_ui_x (int x)
 {
 	struct adaptive_ui_layout layout = get_adaptive_ui_layout ();
-	if (layout.scale_num <= 0)
-		return x - layout.left;
-	return ((x - layout.left) * layout.scale_den + layout.scale_num / 2) / layout.scale_num;
+	int source_left = (screen_width_or_base () - BASE_SCREEN_WIDTH) / 2;
+	int tr = screen_coord_to_base_canvas (x, layout.left, layout.width, source_left, BASE_SCREEN_WIDTH);
+	return not_above (screen_width_or_base () - 1, not_below (0, tr));
 }
 
 static int
 screen_to_base_ui_y (int y)
 {
 	struct adaptive_ui_layout layout = get_adaptive_ui_layout ();
-	if (layout.scale_num <= 0)
-		return y - layout.top;
-	return ((y - layout.top) * layout.scale_den + layout.scale_num / 2) / layout.scale_num;
+	int source_top = (screen_height_or_base () - BASE_SCREEN_HEIGHT) / 2;
+	int tr = screen_coord_to_base_canvas (y, layout.top, layout.height, source_top, BASE_SCREEN_HEIGHT);
+	return not_above (screen_height_or_base () - 1, not_below (0, tr));
+}
+
+static bool
+form_chain_contains (Base_Form * form, Base_Form * target)
+{
+	for (int depth = 0; (form != NULL) && (depth < 32); depth++) {
+		if (form == target)
+			return true;
+		form = form->Data.Parent;
+	}
+	return false;
+}
+
+static Base_Form *
+get_form_chain_root (Base_Form * form)
+{
+	Base_Form * root = form;
+	for (int depth = 0; (form != NULL) && (depth < 32); depth++) {
+		root = form;
+		form = form->Data.Parent;
+	}
+	return root;
+}
+
+static bool
+is_fixed_screen_form_active ()
+{
+	if (is->adaptive_ui_dialog_depth > 0)
+		return true;
+
+	Base_Form * candidates[2] = {NULL, NULL};
+	if (p_mouse_capture_form != NULL)
+		candidates[0] = *p_mouse_capture_form;
+	if (p_focused_form != NULL)
+		candidates[1] = *p_focused_form;
+
+	for (int n = 0; n < ARRAY_LEN (candidates); n++) {
+		Base_Form * form = candidates[n];
+		if (form == NULL)
+			continue;
+		if ((p_civilopedia_form != NULL) &&
+		    form_chain_contains (form, (Base_Form *)p_civilopedia_form))
+			return true;
+
+		Base_Form * root = get_form_chain_root (form);
+		if ((root == NULL) || (root == (Base_Form *)p_main_screen_form) ||
+		    (root == (Base_Form *)p_city_form))
+			continue;
+
+		int width = root->Data.Right - root->Data.Left,
+		    height = root->Data.Bottom - root->Data.Top;
+		if ((width >= 1000) && (width <= 1040) &&
+		    (height >= 740) && (height <= 800))
+			return true;
+	}
+	return false;
+}
+
+static bool
+adaptive_ui_scaling_active ()
+{
+	if (! is->current_config.adaptive_resolution_ui_scaling)
+		return false;
+
+	bool in_main_menu = (p_is_in_main_menu != NULL) && (*p_is_in_main_menu != 0);
+	if (! in_main_menu && ! is_fixed_screen_form_active ())
+		return false;
+
+	int screen_w = screen_width_or_base (), screen_h = screen_height_or_base ();
+	if ((screen_w <= BASE_SCREEN_WIDTH) && (screen_h <= BASE_SCREEN_HEIGHT))
+		return false;
+
+	struct adaptive_ui_layout layout = get_adaptive_ui_layout ();
+	return (layout.left != (screen_w - BASE_SCREEN_WIDTH) / 2) ||
+	       (layout.top != (screen_h - BASE_SCREEN_HEIGHT) / 2) ||
+	       (layout.width != BASE_SCREEN_WIDTH) ||
+	       (layout.height != BASE_SCREEN_HEIGHT);
 }
 
 static void
@@ -771,6 +871,222 @@ get_adaptive_map_tile_margin ()
 	int margin_x = (extra_w + tile_half_w - 1) / tile_half_w,
 	    margin_y = (extra_h + tile_half_h - 1) / tile_half_h;
 	return 4 + ((margin_x > margin_y) ? margin_x : margin_y);
+}
+
+static void
+discard_adaptive_ui_cache ()
+{
+	if (is->adaptive_ui_cache_dc != NULL) {
+		if (is->adaptive_ui_cache_old_bitmap != NULL)
+			SelectObject (is->adaptive_ui_cache_dc, is->adaptive_ui_cache_old_bitmap);
+		if (is->adaptive_ui_cache_bitmap != NULL)
+			DeleteObject (is->adaptive_ui_cache_bitmap);
+		DeleteDC (is->adaptive_ui_cache_dc);
+	}
+
+	is->adaptive_ui_cache_dc = NULL;
+	is->adaptive_ui_cache_bitmap = NULL;
+	is->adaptive_ui_cache_old_bitmap = NULL;
+	is->adaptive_ui_cache_width = 0;
+	is->adaptive_ui_cache_height = 0;
+}
+
+static bool
+ensure_adaptive_ui_cache (HDC canvas_dc, int screen_w, int screen_h)
+{
+	if ((CreateCompatibleDC == NULL) || (CreateCompatibleBitmap == NULL) ||
+	    (SelectObject == NULL) || (DeleteObject == NULL) || (DeleteDC == NULL))
+		return false;
+
+	if ((is->adaptive_ui_cache_dc != NULL) &&
+	    (is->adaptive_ui_cache_width == screen_w) &&
+	    (is->adaptive_ui_cache_height == screen_h))
+		return true;
+
+	discard_adaptive_ui_cache ();
+	is->adaptive_ui_cache_dc = CreateCompatibleDC (canvas_dc);
+	if (is->adaptive_ui_cache_dc == NULL)
+		return false;
+
+	is->adaptive_ui_cache_bitmap = CreateCompatibleBitmap (canvas_dc, screen_w, screen_h);
+	if (is->adaptive_ui_cache_bitmap == NULL) {
+		discard_adaptive_ui_cache ();
+		return false;
+	}
+
+	HGDIOBJ old_bitmap = SelectObject (is->adaptive_ui_cache_dc, is->adaptive_ui_cache_bitmap);
+	if ((old_bitmap == NULL) || (old_bitmap == HGDI_ERROR)) {
+		discard_adaptive_ui_cache ();
+		return false;
+	}
+	is->adaptive_ui_cache_old_bitmap = old_bitmap;
+
+	is->adaptive_ui_cache_width = screen_w;
+	is->adaptive_ui_cache_height = screen_h;
+	return true;
+}
+
+Base_Form * __cdecl
+patch_GUI_route_mouse_event (int * px, int * py)
+{
+	if (! adaptive_ui_scaling_active () || (px == NULL) || (py == NULL))
+		return GUI_route_mouse_event (px, py);
+
+	*px = screen_to_base_ui_x (*px);
+	*py = screen_to_base_ui_y (*py);
+	is->adaptive_ui_coordinate_remap_depth++;
+	Base_Form * tr = GUI_route_mouse_event (px, py);
+	is->adaptive_ui_coordinate_remap_depth--;
+	return tr;
+}
+
+Base_Form * __fastcall
+patch_GUI_route_captured_mouse_event (Base_Form * this, int edx, int x, int y)
+{
+	if (! adaptive_ui_scaling_active ())
+		return GUI_route_captured_mouse_event (this, __, x, y);
+
+	x = screen_to_base_ui_x (x);
+	y = screen_to_base_ui_y (y);
+	is->adaptive_ui_coordinate_remap_depth++;
+	Base_Form * tr = GUI_route_captured_mouse_event (this, __, x, y);
+	is->adaptive_ui_coordinate_remap_depth--;
+	return tr;
+}
+
+void __fastcall
+patch_Base_Form_screen_to_local (Base_Form * this, int edx, int * px, int * py)
+{
+	if (adaptive_ui_scaling_active () && (is->adaptive_ui_coordinate_remap_depth == 0) &&
+	    (px != NULL) && (py != NULL)) {
+		*px = screen_to_base_ui_x (*px);
+		*py = screen_to_base_ui_y (*py);
+	}
+	Base_Form_screen_to_local (this, __, px, py);
+}
+
+void __fastcall
+patch_Base_Form_get_mouse_pos (Base_Form * this, int edx, int * px, int * py)
+{
+	int delta_x = 0, delta_y = 0;
+	if (adaptive_ui_scaling_active () && (p_graphsy_ptr != NULL) &&
+	    (px != NULL) && (py != NULL)) {
+		void * graphsy = *p_graphsy_ptr;
+		if (graphsy != NULL) {
+			void ** vtable = *(void ***)graphsy;
+			if ((vtable != NULL) && (vtable[11] != NULL)) {
+				typedef void (__fastcall * get_mouse_pos_t) (void * this, int edx, int * px, int * py);
+				int raw_x = 0, raw_y = 0;
+				((get_mouse_pos_t)vtable[11]) (graphsy, __, &raw_x, &raw_y);
+				delta_x = screen_to_base_ui_x (raw_x) - raw_x;
+				delta_y = screen_to_base_ui_y (raw_y) - raw_y;
+			}
+		}
+	}
+
+	Base_Form_get_mouse_pos (this, __, px, py);
+	if (px != NULL)
+		*px += delta_x;
+	if (py != NULL)
+		*py += delta_y;
+}
+
+static void __fastcall
+patch_adaptive_ui_present (void * this, int edx, RECT * dirty_or_null)
+{
+	if ((is->adaptive_ui_present_depth > 0) || ! adaptive_ui_scaling_active () ||
+	    (p_engine_screen_pcx == NULL) ||
+	    (BitBlt == NULL) || (StretchBlt == NULL) ||
+	    (SetStretchBltMode == NULL) || (PatBlt == NULL)) {
+		is->adaptive_ui_original_present (this, __, dirty_or_null);
+		return;
+	}
+
+	JGL_Image * canvas = p_engine_screen_pcx->JGL.Image;
+	if ((canvas == NULL) || (canvas->vtable == NULL)) {
+		is->adaptive_ui_original_present (this, __, dirty_or_null);
+		return;
+	}
+
+	HDC canvas_dc = canvas->vtable->acquire_dc (canvas);
+	if (canvas_dc == NULL) {
+		is->adaptive_ui_original_present (this, __, dirty_or_null);
+		return;
+	}
+
+	int screen_w = screen_width_or_base (),
+	    screen_h = screen_height_or_base (),
+	    source_left = (screen_w - BASE_SCREEN_WIDTH) / 2,
+	    source_top = (screen_h - BASE_SCREEN_HEIGHT) / 2;
+	struct adaptive_ui_layout layout = get_adaptive_ui_layout ();
+	bool saved_source = ensure_adaptive_ui_cache (canvas_dc, screen_w, screen_h) &&
+		BitBlt (is->adaptive_ui_cache_dc, 0, 0, screen_w, screen_h, canvas_dc, 0, 0, SRCCOPY);
+	bool scaled = false;
+	if (saved_source) {
+		int clipped_source_left = not_below (0, source_left),
+		    clipped_source_top = not_below (0, source_top),
+		    clipped_source_right = not_above (screen_w, source_left + BASE_SCREEN_WIDTH),
+		    clipped_source_bottom = not_above (screen_h, source_top + BASE_SCREEN_HEIGHT),
+		    clipped_source_width = clipped_source_right - clipped_source_left,
+		    clipped_source_height = clipped_source_bottom - clipped_source_top,
+		    clipped_dest_left = layout.left + scale_layout_value (clipped_source_left - source_left, layout.width, BASE_SCREEN_WIDTH),
+		    clipped_dest_top = layout.top + scale_layout_value (clipped_source_top - source_top, layout.height, BASE_SCREEN_HEIGHT),
+		    clipped_dest_right = layout.left + scale_layout_value (clipped_source_right - source_left, layout.width, BASE_SCREEN_WIDTH),
+		    clipped_dest_bottom = layout.top + scale_layout_value (clipped_source_bottom - source_top, layout.height, BASE_SCREEN_HEIGHT);
+		PatBlt (canvas_dc, 0, 0, screen_w, screen_h, BLACKNESS);
+		SetStretchBltMode (canvas_dc, COLORONCOLOR);
+		scaled = (clipped_source_width > 0) && (clipped_source_height > 0) &&
+			StretchBlt (canvas_dc, clipped_dest_left, clipped_dest_top,
+				clipped_dest_right - clipped_dest_left, clipped_dest_bottom - clipped_dest_top,
+				is->adaptive_ui_cache_dc, clipped_source_left, clipped_source_top,
+				clipped_source_width, clipped_source_height, SRCCOPY);
+		if (! scaled)
+			BitBlt (canvas_dc, 0, 0, screen_w, screen_h, is->adaptive_ui_cache_dc, 0, 0, SRCCOPY);
+	}
+	canvas->vtable->release_dc (canvas, __, 1);
+
+	if (! scaled) {
+		is->adaptive_ui_original_present (this, __, dirty_or_null);
+		return;
+	}
+
+	is->adaptive_ui_present_depth++;
+	is->adaptive_ui_original_present (this, __, NULL);
+	is->adaptive_ui_present_depth--;
+	canvas_dc = canvas->vtable->acquire_dc (canvas);
+	if (canvas_dc != NULL) {
+		BitBlt (canvas_dc, 0, 0, screen_w, screen_h, is->adaptive_ui_cache_dc, 0, 0, SRCCOPY);
+		canvas->vtable->release_dc (canvas, __, 1);
+	}
+}
+
+static void
+ensure_adaptive_ui_present_hook ()
+{
+	if ((is->adaptive_ui_original_present != NULL) || (p_graphsy_ptr == NULL))
+		return;
+
+	void * graphsy = *p_graphsy_ptr;
+	if (graphsy == NULL)
+		return;
+	void ** vtable = *(void ***)graphsy;
+	if ((vtable == NULL) || (vtable[41] == NULL))
+		return;
+
+	is->adaptive_ui_original_present = vtable[41];
+	DWORD old_protect, unused;
+	if (VirtualProtect (&vtable[41], sizeof vtable[41], PAGE_EXECUTE_READWRITE, &old_protect)) {
+		vtable[41] = patch_adaptive_ui_present;
+		VirtualProtect (&vtable[41], sizeof vtable[41], old_protect, &unused);
+	} else
+		is->adaptive_ui_original_present = NULL;
+}
+
+int __cdecl
+patch_GUI_update_screen (RECT * dirty_or_null)
+{
+	ensure_adaptive_ui_present_hook ();
+	return GUI_update_screen (dirty_or_null);
 }
 
 void __fastcall
@@ -18761,7 +19077,7 @@ patch_init_floating_point ()
 		{"convert_some_popups_into_online_mp_messages"           , false, offsetof (struct c3x_config, convert_some_popups_into_online_mp_messages)},
 		{"enable_debug_mode_switch"                              , false, offsetof (struct c3x_config, enable_debug_mode_switch)},
 		{"accentuate_cities_on_minimap"                          , false, offsetof (struct c3x_config, accentuate_cities_on_minimap)},
-		{"adaptive_resolution_map_view"                          , true , offsetof (struct c3x_config, adaptive_resolution_map_view)},
+		{"adaptive_resolution_map_view"                          , false, offsetof (struct c3x_config, adaptive_resolution_map_view)},
 		{"adaptive_resolution_ui_scaling"                         , true , offsetof (struct c3x_config, adaptive_resolution_ui_scaling)},
 		{"allow_multipage_civilopedia_descriptions"              , true , offsetof (struct c3x_config, allow_multipage_civilopedia_descriptions)},
 		{"reformat_turns_remaining_on_domestic_advisor_screen"   , true , offsetof (struct c3x_config, reformat_turns_remaining_on_domestic_advisor_screen)},
@@ -18908,6 +19224,16 @@ patch_init_floating_point ()
 	MessageBoxA  = (void *)(*p_GetProcAddress) (is->user32, "MessageBoxA");
 	is->msimg32  = LoadLibraryA ("Msimg32.dll");
 	TransparentBlt = (void *)(*p_GetProcAddress) (is->msimg32, "TransparentBlt");
+	is->gdi32 = LoadLibraryA ("Gdi32.dll");
+	CreateCompatibleDC     = (void *)(*p_GetProcAddress) (is->gdi32, "CreateCompatibleDC");
+	CreateCompatibleBitmap = (void *)(*p_GetProcAddress) (is->gdi32, "CreateCompatibleBitmap");
+	SelectObject           = (void *)(*p_GetProcAddress) (is->gdi32, "SelectObject");
+	DeleteObject           = (void *)(*p_GetProcAddress) (is->gdi32, "DeleteObject");
+	DeleteDC               = (void *)(*p_GetProcAddress) (is->gdi32, "DeleteDC");
+	BitBlt                 = (void *)(*p_GetProcAddress) (is->gdi32, "BitBlt");
+	StretchBlt             = (void *)(*p_GetProcAddress) (is->gdi32, "StretchBlt");
+	SetStretchBltMode      = (void *)(*p_GetProcAddress) (is->gdi32, "SetStretchBltMode");
+	PatBlt                 = (void *)(*p_GetProcAddress) (is->gdi32, "PatBlt");
 	snprintf = (void *)(*p_GetProcAddress) (is->msvcrt, "_snprintf");
 	malloc   = (void *)(*p_GetProcAddress) (is->msvcrt, "malloc");
 	calloc   = (void *)(*p_GetProcAddress) (is->msvcrt, "calloc");
@@ -25181,9 +25507,9 @@ patch_Parameters_Form_m68_Show_Dialog (Parameters_Form * this, int edx, int para
 		Button_initialize (b, __,
 				   is->c3x_labels[CL_MOD_INFO_BUTTON_TEXT], // text
 				   MOD_INFO_BUTTON_ID, // control ID
-				   base_ui_to_screen_x (891), // location x
-				   base_ui_to_screen_y (31),  // location y
-				   base_ui_to_screen_size (MOD_INFO_BUTTON_WIDTH), base_ui_to_screen_size (MOD_INFO_BUTTON_HEIGHT), // width, height
+				   (p_bic_data->ScreenWidth - 1024) / 2 + 891, // location x
+				   (p_bic_data->ScreenHeight - 768) / 2 + 31,  // location y
+				   MOD_INFO_BUTTON_WIDTH, MOD_INFO_BUTTON_HEIGHT, // width, height
 				   (Base_Form *)this, // parent
 				   0); // ?
 
@@ -25196,7 +25522,9 @@ patch_Parameters_Form_m68_Show_Dialog (Parameters_Form * this, int edx, int para
 		b->vtable->m73_call_m22_Draw ((Base_Form *)b);
 	}
 
+	is->adaptive_ui_dialog_depth++;
 	int tr = Parameters_Form_m68_Show_Dialog (this, __, param_1, param_2, param_3);
+	is->adaptive_ui_dialog_depth--;
 
 	if (b != NULL) {
 		b->vtable->destruct ((Base_Form *)b, __, 0);
@@ -35224,7 +35552,9 @@ patch_Civilopedia_Form_m68_Show_Dialog (Civilopedia_Form * this, int edx, int pa
 	is->cmpd.effects_btn  = bs[0];
 	is->cmpd.previous_btn = bs[1];
 
+	is->adaptive_ui_dialog_depth++;
 	int tr = Civilopedia_Form_m68_Show_Dialog (this, __, param_1, param_2, param_3);
+	is->adaptive_ui_dialog_depth--;
 
 	for (int n = 0; n < ARRAY_LEN (bs); n++)
 		if (bs[n] != NULL) {
