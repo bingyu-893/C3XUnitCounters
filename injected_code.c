@@ -302,12 +302,10 @@ int __fastcall
 patch_show_popup (void * this, int edx, int param_1, int param_2)
 {
 	int tr;
-	is->adaptive_ui_dialog_depth++;
 	WITH_PAUSE_FOR_POPUP {
 		is->show_popup_was_called = 1;
 		tr = show_popup (this, __, param_1, param_2);
 	}
-	is->adaptive_ui_dialog_depth--;
 	return tr;
 }
 
@@ -756,11 +754,6 @@ get_adaptive_ui_source_viewport ()
 	    base_left = (screen_w - BASE_SCREEN_WIDTH) / 2,
 	    base_top = (screen_h - BASE_SCREEN_HEIGHT) / 2;
 
-	if (is->adaptive_ui_source_override_depth > 0) {
-		base_left = is->adaptive_ui_source_override_left;
-		base_top = is->adaptive_ui_source_override_top;
-	}
-
 	struct adaptive_ui_source_viewport tr = {
 		.left = base_left,
 		.top = base_top,
@@ -801,6 +794,11 @@ static bool
 form_chain_contains_fixed_screen_form (Base_Form * form)
 {
 	for (int depth = 0; (form != NULL) && (depth < 32); depth++) {
+		// Diplomacy draws incrementally into the shared map canvas. Treating it as
+		// a fixed full-screen form would scale the map together with the dialog.
+		if ((p_diplo_form != NULL) && (form == (Base_Form *)p_diplo_form))
+			return false;
+
 		if ((p_civilopedia_form != NULL) &&
 		    (form == (Base_Form *)p_civilopedia_form))
 			return true;
@@ -20890,24 +20888,7 @@ patch_DiploForm_m68_Show_Dialog (DiploForm * this, int edx, int param_1, void * 
 
 	}
 
-	int previous_source_override_depth = is->adaptive_ui_source_override_depth,
-	    previous_source_left = is->adaptive_ui_source_override_left,
-	    previous_source_top = is->adaptive_ui_source_override_top;
-	// Diplomacy uses its own 1024x768 root instead of the centered advisor/menu
-	// source region. Use the form's actual screen origin when its bounds are
-	// initialized, falling back to the upper-left origin used by the base game.
-	int diplo_width = this->base.Data.Right - this->base.Data.Left,
-	    diplo_height = this->base.Data.Bottom - this->base.Data.Top;
-	is->adaptive_ui_source_override_depth++;
-	is->adaptive_ui_source_override_left = ((diplo_width >= 1000) && (diplo_width <= 1040)) ? this->base.Data.Left : 0;
-	is->adaptive_ui_source_override_top = ((diplo_height >= 740) && (diplo_height <= 800)) ? this->base.Data.Top : 0;
-	is->adaptive_ui_dialog_depth++;
-	int tr = DiploForm_m68_Show_Dialog (this, __, param_1, param_2, param_3);
-	is->adaptive_ui_dialog_depth--;
-	is->adaptive_ui_source_override_depth = previous_source_override_depth;
-	is->adaptive_ui_source_override_left = previous_source_left;
-	is->adaptive_ui_source_override_top = previous_source_top;
-	return tr;
+	return DiploForm_m68_Show_Dialog (this, __, param_1, param_2, param_3);
 }
 
 void __fastcall
