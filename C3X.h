@@ -1765,7 +1765,11 @@ struct injected_state {
 	int adaptive_ui_cache_height;
 	int adaptive_ui_coordinate_remap_depth;
 	int adaptive_ui_dialog_depth;
+	int adaptive_ui_source_override_depth;
+	int adaptive_ui_source_override_left;
+	int adaptive_ui_source_override_top;
 	int adaptive_ui_present_depth;
+	Sprite * adaptive_ui_present_cursor;
 	void (__fastcall * adaptive_ui_original_present) (void * this, int edx, RECT * dirty_or_null);
 
 	int saved_road_movement_rate; // Valid when railroad movement limit is applied (limit_railroad_movement > 0) and BIC data has been loaded

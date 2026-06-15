@@ -302,10 +302,12 @@ int __fastcall
 patch_show_popup (void * this, int edx, int param_1, int param_2)
 {
 	int tr;
+	is->adaptive_ui_dialog_depth++;
 	WITH_PAUSE_FOR_POPUP {
 		is->show_popup_was_called = 1;
 		tr = show_popup (this, __, param_1, param_2);
 	}
+	is->adaptive_ui_dialog_depth--;
 	return tr;
 }
 
@@ -651,6 +653,10 @@ struct adaptive_ui_layout {
 	int scale_num, scale_den;
 };
 
+struct adaptive_ui_source_viewport {
+	int left, top, width, height;
+};
+
 static int
 screen_width_or_base ()
 {
@@ -689,12 +695,15 @@ get_adaptive_ui_layout ()
 	if (! is->current_config.adaptive_resolution_ui_scaling)
 		return tr;
 
-	if (screen_w * BASE_SCREEN_HEIGHT <= screen_h * BASE_SCREEN_WIDTH) {
-		tr.scale_num = screen_w;
-		tr.scale_den = BASE_SCREEN_WIDTH;
-	} else {
+	// Scale the base UI until one dimension fills the display. The logical
+	// source viewport is expanded along the other dimension, so the final
+	// image matches the monitor aspect ratio without stretching the UI.
+	if (screen_w * BASE_SCREEN_HEIGHT >= screen_h * BASE_SCREEN_WIDTH) {
 		tr.scale_num = screen_h;
 		tr.scale_den = BASE_SCREEN_HEIGHT;
+	} else {
+		tr.scale_num = screen_w;
+		tr.scale_den = BASE_SCREEN_WIDTH;
 	}
 
 	tr.width = scale_layout_value (BASE_SCREEN_WIDTH, tr.scale_num, tr.scale_den);
@@ -739,44 +748,84 @@ screen_coord_to_base_canvas (int coord, int dest_offset, int dest_size, int sour
 	return tr;
 }
 
+static struct adaptive_ui_source_viewport
+get_adaptive_ui_source_viewport ()
+{
+	int screen_w = screen_width_or_base (),
+	    screen_h = screen_height_or_base (),
+	    base_left = (screen_w - BASE_SCREEN_WIDTH) / 2,
+	    base_top = (screen_h - BASE_SCREEN_HEIGHT) / 2;
+
+	if (is->adaptive_ui_source_override_depth > 0) {
+		base_left = is->adaptive_ui_source_override_left;
+		base_top = is->adaptive_ui_source_override_top;
+	}
+
+	struct adaptive_ui_source_viewport tr = {
+		.left = base_left,
+		.top = base_top,
+		.width = BASE_SCREEN_WIDTH,
+		.height = BASE_SCREEN_HEIGHT
+	};
+	if (screen_w * BASE_SCREEN_HEIGHT >= screen_h * BASE_SCREEN_WIDTH)
+		tr.width = (BASE_SCREEN_HEIGHT * screen_w + screen_h / 2) / screen_h;
+	else
+		tr.height = (BASE_SCREEN_WIDTH * screen_h + screen_w / 2) / screen_w;
+
+	tr.left = base_left - (tr.width - BASE_SCREEN_WIDTH) / 2;
+	tr.top = base_top - (tr.height - BASE_SCREEN_HEIGHT) / 2;
+	if (screen_w >= tr.width)
+		tr.left = not_above (screen_w - tr.width, not_below (0, tr.left));
+	if (screen_h >= tr.height)
+		tr.top = not_above (screen_h - tr.height, not_below (0, tr.top));
+	return tr;
+}
+
 static int
 screen_to_base_ui_x (int x)
 {
-	struct adaptive_ui_layout layout = get_adaptive_ui_layout ();
-	int source_left = (screen_width_or_base () - BASE_SCREEN_WIDTH) / 2;
-	int tr = screen_coord_to_base_canvas (x, layout.left, layout.width, source_left, BASE_SCREEN_WIDTH);
+	struct adaptive_ui_source_viewport source = get_adaptive_ui_source_viewport ();
+	int tr = screen_coord_to_base_canvas (x, 0, screen_width_or_base (), source.left, source.width);
 	return not_above (screen_width_or_base () - 1, not_below (0, tr));
 }
 
 static int
 screen_to_base_ui_y (int y)
 {
-	struct adaptive_ui_layout layout = get_adaptive_ui_layout ();
-	int source_top = (screen_height_or_base () - BASE_SCREEN_HEIGHT) / 2;
-	int tr = screen_coord_to_base_canvas (y, layout.top, layout.height, source_top, BASE_SCREEN_HEIGHT);
+	struct adaptive_ui_source_viewport source = get_adaptive_ui_source_viewport ();
+	int tr = screen_coord_to_base_canvas (y, 0, screen_height_or_base (), source.top, source.height);
 	return not_above (screen_height_or_base () - 1, not_below (0, tr));
 }
 
 static bool
-form_chain_contains (Base_Form * form, Base_Form * target)
+form_chain_contains_fixed_screen_form (Base_Form * form)
 {
 	for (int depth = 0; (form != NULL) && (depth < 32); depth++) {
-		if (form == target)
+		if ((p_civilopedia_form != NULL) &&
+		    (form == (Base_Form *)p_civilopedia_form))
 			return true;
+
+		// The city screen is a full-screen 1024x768 layout even when its root form
+		// has been expanded to the actual display dimensions.
+		if ((p_city_form != NULL) && (form == (Base_Form *)p_city_form))
+			return true;
+		if ((p_espionage_form != NULL) && (form == (Base_Form *)p_espionage_form))
+			return true;
+
+		// Never classify the bare main map as a fixed-screen UI. Advisor and
+		// similar screens are often parented to it, so inspect every child in the
+		// chain before reaching this point instead of checking only the root.
+		if (form != (Base_Form *)p_main_screen_form) {
+			int width = form->Data.Right - form->Data.Left,
+			    height = form->Data.Bottom - form->Data.Top;
+			if ((width >= 1000) && (width <= 1040) &&
+			    (height >= 740) && (height <= 800))
+				return true;
+		}
+
 		form = form->Data.Parent;
 	}
 	return false;
-}
-
-static Base_Form *
-get_form_chain_root (Base_Form * form)
-{
-	Base_Form * root = form;
-	for (int depth = 0; (form != NULL) && (depth < 32); depth++) {
-		root = form;
-		form = form->Data.Parent;
-	}
-	return root;
 }
 
 static bool
@@ -793,21 +842,7 @@ is_fixed_screen_form_active ()
 
 	for (int n = 0; n < ARRAY_LEN (candidates); n++) {
 		Base_Form * form = candidates[n];
-		if (form == NULL)
-			continue;
-		if ((p_civilopedia_form != NULL) &&
-		    form_chain_contains (form, (Base_Form *)p_civilopedia_form))
-			return true;
-
-		Base_Form * root = get_form_chain_root (form);
-		if ((root == NULL) || (root == (Base_Form *)p_main_screen_form) ||
-		    (root == (Base_Form *)p_city_form))
-			continue;
-
-		int width = root->Data.Right - root->Data.Left,
-		    height = root->Data.Bottom - root->Data.Top;
-		if ((width >= 1000) && (width <= 1040) &&
-		    (height >= 740) && (height <= 800))
+		if ((form != NULL) && form_chain_contains_fixed_screen_form (form))
 			return true;
 	}
 	return false;
@@ -1015,24 +1050,22 @@ patch_adaptive_ui_present (void * this, int edx, RECT * dirty_or_null)
 	}
 
 	int screen_w = screen_width_or_base (),
-	    screen_h = screen_height_or_base (),
-	    source_left = (screen_w - BASE_SCREEN_WIDTH) / 2,
-	    source_top = (screen_h - BASE_SCREEN_HEIGHT) / 2;
-	struct adaptive_ui_layout layout = get_adaptive_ui_layout ();
+	    screen_h = screen_height_or_base ();
+	struct adaptive_ui_source_viewport source = get_adaptive_ui_source_viewport ();
 	bool saved_source = ensure_adaptive_ui_cache (canvas_dc, screen_w, screen_h) &&
 		BitBlt (is->adaptive_ui_cache_dc, 0, 0, screen_w, screen_h, canvas_dc, 0, 0, SRCCOPY);
 	bool scaled = false;
 	if (saved_source) {
-		int clipped_source_left = not_below (0, source_left),
-		    clipped_source_top = not_below (0, source_top),
-		    clipped_source_right = not_above (screen_w, source_left + BASE_SCREEN_WIDTH),
-		    clipped_source_bottom = not_above (screen_h, source_top + BASE_SCREEN_HEIGHT),
+		int clipped_source_left = not_below (0, source.left),
+		    clipped_source_top = not_below (0, source.top),
+		    clipped_source_right = not_above (screen_w, source.left + source.width),
+		    clipped_source_bottom = not_above (screen_h, source.top + source.height),
 		    clipped_source_width = clipped_source_right - clipped_source_left,
 		    clipped_source_height = clipped_source_bottom - clipped_source_top,
-		    clipped_dest_left = layout.left + scale_layout_value (clipped_source_left - source_left, layout.width, BASE_SCREEN_WIDTH),
-		    clipped_dest_top = layout.top + scale_layout_value (clipped_source_top - source_top, layout.height, BASE_SCREEN_HEIGHT),
-		    clipped_dest_right = layout.left + scale_layout_value (clipped_source_right - source_left, layout.width, BASE_SCREEN_WIDTH),
-		    clipped_dest_bottom = layout.top + scale_layout_value (clipped_source_bottom - source_top, layout.height, BASE_SCREEN_HEIGHT);
+		    clipped_dest_left = scale_layout_value (clipped_source_left - source.left, screen_w, source.width),
+		    clipped_dest_top = scale_layout_value (clipped_source_top - source.top, screen_h, source.height),
+		    clipped_dest_right = scale_layout_value (clipped_source_right - source.left, screen_w, source.width),
+		    clipped_dest_bottom = scale_layout_value (clipped_source_bottom - source.top, screen_h, source.height);
 		PatBlt (canvas_dc, 0, 0, screen_w, screen_h, BLACKNESS);
 		SetStretchBltMode (canvas_dc, COLORONCOLOR);
 		scaled = (clipped_source_width > 0) && (clipped_source_height > 0) &&
@@ -1049,6 +1082,11 @@ patch_adaptive_ui_present (void * this, int edx, RECT * dirty_or_null)
 		is->adaptive_ui_original_present (this, __, dirty_or_null);
 		return;
 	}
+
+	if ((is->adaptive_ui_present_cursor != NULL) &&
+	    (p_software_cursor_x != NULL) && (p_software_cursor_y != NULL))
+		Sprite_draw (is->adaptive_ui_present_cursor, __, p_engine_screen_pcx,
+			*p_software_cursor_x, *p_software_cursor_y, NULL);
 
 	is->adaptive_ui_present_depth++;
 	is->adaptive_ui_original_present (this, __, NULL);
@@ -1086,7 +1124,23 @@ int __cdecl
 patch_GUI_update_screen (RECT * dirty_or_null)
 {
 	ensure_adaptive_ui_present_hook ();
-	return GUI_update_screen (dirty_or_null);
+
+	if (! adaptive_ui_scaling_active () ||
+	    (is->adaptive_ui_original_present == NULL) ||
+	    (p_software_cursor_sprite == NULL) ||
+	    (p_software_cursor_x == NULL) || (p_software_cursor_y == NULL))
+		return GUI_update_screen (dirty_or_null);
+
+	// Keep the software cursor out of the persistent logical canvas. The
+	// present hook composites it once at physical screen coordinates after the
+	// UI has been scaled, then restores the unscaled canvas after presenting.
+	Sprite * cursor = *p_software_cursor_sprite;
+	is->adaptive_ui_present_cursor = cursor;
+	*p_software_cursor_sprite = NULL;
+	int tr = GUI_update_screen (dirty_or_null);
+	*p_software_cursor_sprite = cursor;
+	is->adaptive_ui_present_cursor = NULL;
+	return tr;
 }
 
 void __fastcall
@@ -20836,7 +20890,24 @@ patch_DiploForm_m68_Show_Dialog (DiploForm * this, int edx, int param_1, void * 
 
 	}
 
-	return DiploForm_m68_Show_Dialog (this, __, param_1, param_2, param_3);
+	int previous_source_override_depth = is->adaptive_ui_source_override_depth,
+	    previous_source_left = is->adaptive_ui_source_override_left,
+	    previous_source_top = is->adaptive_ui_source_override_top;
+	// Diplomacy uses its own 1024x768 root instead of the centered advisor/menu
+	// source region. Use the form's actual screen origin when its bounds are
+	// initialized, falling back to the upper-left origin used by the base game.
+	int diplo_width = this->base.Data.Right - this->base.Data.Left,
+	    diplo_height = this->base.Data.Bottom - this->base.Data.Top;
+	is->adaptive_ui_source_override_depth++;
+	is->adaptive_ui_source_override_left = ((diplo_width >= 1000) && (diplo_width <= 1040)) ? this->base.Data.Left : 0;
+	is->adaptive_ui_source_override_top = ((diplo_height >= 740) && (diplo_height <= 800)) ? this->base.Data.Top : 0;
+	is->adaptive_ui_dialog_depth++;
+	int tr = DiploForm_m68_Show_Dialog (this, __, param_1, param_2, param_3);
+	is->adaptive_ui_dialog_depth--;
+	is->adaptive_ui_source_override_depth = previous_source_override_depth;
+	is->adaptive_ui_source_override_left = previous_source_left;
+	is->adaptive_ui_source_override_top = previous_source_top;
+	return tr;
 }
 
 void __fastcall
@@ -21743,9 +21814,67 @@ patch_City_Form_open (City_Form * this, int edx, City * city, int param_2)
 {
 	recompute_resources_if_necessary ();
 
+	is->adaptive_ui_dialog_depth++;
 	WITH_PAUSE_FOR_POPUP {
 		City_Form_open (this, __, city, param_2);
 	}
+	is->adaptive_ui_dialog_depth--;
+}
+
+void __fastcall
+patch_Advisor_GUI_open (Advisor_GUI * this, int edx, AdvisorKind kind)
+{
+	is->adaptive_ui_dialog_depth++;
+	Advisor_GUI_open (this, __, kind);
+	is->adaptive_ui_dialog_depth--;
+}
+
+void __fastcall
+patch_Espionage_Form_open (Espionage_Form * this, int edx, int civ_id)
+{
+	is->adaptive_ui_dialog_depth++;
+	Espionage_Form_open (this, __, civ_id);
+	is->adaptive_ui_dialog_depth--;
+}
+
+void __fastcall
+patch_Wonders_Form_open (Wonders_Form * this)
+{
+	is->adaptive_ui_dialog_depth++;
+	Wonders_Form_open (this);
+	is->adaptive_ui_dialog_depth--;
+}
+
+void __fastcall
+patch_Victory_Conditions_Form_open (Victory_Conditions_Form * this)
+{
+	is->adaptive_ui_dialog_depth++;
+	Victory_Conditions_Form_open (this);
+	is->adaptive_ui_dialog_depth--;
+}
+
+void __fastcall
+patch_Palace_View_Form_open (Palace_View_Form * this, int edx, Palace_View_Info * info)
+{
+	is->adaptive_ui_dialog_depth++;
+	Palace_View_Form_open (this, __, info);
+	is->adaptive_ui_dialog_depth--;
+}
+
+void __fastcall
+patch_Spaceship_Form_open (Spaceship_Form * this, int edx, int param_1)
+{
+	is->adaptive_ui_dialog_depth++;
+	Spaceship_Form_open (this, __, param_1);
+	is->adaptive_ui_dialog_depth--;
+}
+
+void __fastcall
+patch_Demographics_Form_open (Demographics_Form * this)
+{
+	is->adaptive_ui_dialog_depth++;
+	Demographics_Form_open (this);
+	is->adaptive_ui_dialog_depth--;
 }
 
 void
