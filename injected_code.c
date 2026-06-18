@@ -18601,6 +18601,7 @@ patch_init_floating_point ()
 		{"promote_wonder_decorruption_effect"                    , false, offsetof (struct c3x_config, promote_wonder_decorruption_effect)},
 		{"allow_military_leaders_to_hurry_wonders"               , false, offsetof (struct c3x_config, allow_military_leaders_to_hurry_wonders)},
 		{"allow_multiple_battle_created_units_per_player"        , false, offsetof (struct c3x_config, allow_multiple_battle_created_units_per_player)},
+		{"building_generated_leaders_are_scientific"             , true , offsetof (struct c3x_config, building_generated_leaders_are_scientific)},
 		{"aggressively_penalize_bankruptcy"                      , false, offsetof (struct c3x_config, aggressively_penalize_bankruptcy)},
 		{"no_penalty_exception_for_agri_fresh_water_city_tiles"  , false, offsetof (struct c3x_config, no_penalty_exception_for_agri_fresh_water_city_tiles)},
 		{"use_offensive_artillery_ai"                            , true , offsetof (struct c3x_config, use_offensive_artillery_ai)},
@@ -31315,8 +31316,13 @@ patch_Leader_spawn_unit_from_building (Leader * this, int edx, int type_id, int 
 	int available;
 	if (get_available_unit_count (this, type_id, &available) && (available <= 0))
 		return NULL;
-	else
-		return patch_Leader_spawn_unit (this, __, type_id, tile_x, tile_y, barb_tribe_id, id, param_6, leader_kind, race_id);
+
+	if (is->current_config.building_generated_leaders_are_scientific &&
+	    (type_id >= 0) && (type_id < p_bic_data->UnitTypeCount) &&
+	    UnitType_has_ability (&p_bic_data->UnitTypes[type_id], __, UTA_Leader))
+		leader_kind = LK_Scientific;
+
+	return patch_Leader_spawn_unit (this, __, type_id, tile_x, tile_y, barb_tribe_id, id, param_6, leader_kind, race_id);
 }
 
 int __fastcall

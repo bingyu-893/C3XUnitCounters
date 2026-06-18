@@ -311,6 +311,7 @@ struct c3x_config {
 	bool promote_wonder_decorruption_effect;
 	bool allow_military_leaders_to_hurry_wonders;
 	bool allow_multiple_battle_created_units_per_player;
+	bool building_generated_leaders_are_scientific;
 	int scientific_leader_chance_percent;
 	int scientific_trait_scientific_leader_chance_percent;
 	int science_age_duration_turns;
