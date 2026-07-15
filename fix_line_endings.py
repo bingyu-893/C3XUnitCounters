@@ -39,6 +39,7 @@ LINE_ENDING_POLICY = {
     "common.c": CRLF,
     "commonre.py": CRLF,
     "default.c3x_config.ini": CRLF,
+    "default.civilization_traits_config.txt": LF,
     "default.districts_config.txt": LF,
     "default.districts_natural_wonders_config.txt": LF,
     "default.districts_wonders_config.txt": LF,

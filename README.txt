@@ -17,6 +17,8 @@ All aspects of C3X are configurable through INI text files. The basic INI file i
 
 However, because the default config file gets updated with each new release of the mod, it's recommended to put changes like the one above in a new file named "custom.c3x_config.ini". C3X supports up to three different config files, the default config, a scenario config named "scenario.c3x_config.ini" located in a scenario's search folder, and a custom config. They are loaded in that order. Scenario configs are intended to contain rule settings relevant to a particular scenario and custom configs are intended to function like user preferences. For a quick example of a scenario config, see this post: https://forums.civfanatics.com/threads/c3x-exe-mod-including-bug-fixes-stack-bombard-and-much-more.666881/page-28#post-16212316.
 
+Civilization trait effects use separate profile files. See "default.civilization_traits_config.txt" for the complete field reference, loading rules, and copyable examples.
+
 === MORE INFO ===
 The mod's main page on CivFanatics is here: https://forums.civfanatics.com/resources/c3x.28759/
 The mod is hosted on GitHub here: https://github.com/maxpetul/C3X

@@ -1,0 +1,410 @@
+; C3X civilization trait effect profiles
+;
+; ==================================== IMPORTANT ====================================
+; Do not edit this default file for personal or scenario changes: a C3X update may
+; replace it. Put personal overrides in user.civilization_traits_config.txt in the
+; C3X folder. Put scenario rules in scenario.civilization_traits_config.txt in the
+; scenario search folder. Both files may contain only the #Trait blocks and fields
+; they need to override.
+; ===================================================================================
+;
+; OVERVIEW
+;
+; This file changes the gameplay effects attached to the eight original trait
+; identities. Trait identity itself remains the Race.Bonuses bits stored in the
+; BIQ. These profiles therefore do not reassign Civilopedia trait names, starting
+; technologies, or the traits used to match Great Wonders for a Golden Age.
+;
+; C3X loads the profile files from lowest to highest priority:
+;   1. default.civilization_traits_config.txt (this file, in the C3X folder)
+;   2. scenario.civilization_traits_config.txt (in the scenario search folder)
+;   3. user.civilization_traits_config.txt (in the C3X folder)
+;
+; A later file overrides fields set by earlier files. Scenario and user files are
+; sparse overlays: omitted traits and omitted fields keep their previously loaded
+; values. Each file is transactional. If a file contains an invalid value, unknown
+; key, bad directive, duplicate field, or missing/unknown name, none of that file is
+; applied; later valid files are still loaded.
+;
+; Every profile block begins with #Trait and requires name. Trait names and values
+; in building_discount_tags use these stable, case-insensitive English tokens,
+; independent of the game's language:
+;   Militaristic, Commercial, Expansionist, Scientific,
+;   Religious, Industrious, Agricultural, Seafaring
+;
+; NETWORK, SAVES, TIMING, AND DISPLAY
+;
+; Custom profiles are active only in non-network games. Network multiplayer uses
+; the original executable effects because profile synchronization is not yet
+; implemented. Local parse failures are written to the debugger instead of opening
+; a modal error during network play.
+;
+; The external files are not copied into a saved game. New non-network saves store
+; a deterministic schema/profile hash and warn once if the currently loaded files
+; do not match it. Network saves omit this local-only hash; older saves without it
+; continue to load normally.
+;
+; Starting scouts and coastal-start assignment occur once during new-game setup.
+; Free era technologies occur on the next era transition. Changing those values is
+; not retroactive: start a new game or wait for the next applicable event.
+;
+; The Civilopedia's built-in trait descriptions are not rewritten dynamically.
+; Treat the loaded profile files as the authoritative description of custom effects.
+;
+; COMBINING MULTIPLE POSSESSED TRAITS
+;
+; Ordinary numeric bonuses add. promotion_chance_percent, anarchy_length_percent,
+; and worker_rate_percent add their differences from 100, so two values of 150
+; combine to 200. optimal_city_number_bonus_percent is different: 0 is neutral and
+; the configured bonuses add directly. Boolean fields combine with OR.
+;
+; building_cost_percent participates only when its profile's discount tags match
+; an improvement, and the lowest matching value wins. The lowest non-negative
+; anarchy_fixed_turns and sinking chance wins; -1 does not enter those comparisons.
+; A coastal-city commerce bonus is tested against its own profile's threshold before
+; qualifying bonuses add. If multiple profiles request a coastal start, the lowest
+; (least restrictive) threshold wins because satisfying any request is sufficient.
+;
+; TRAIT CONFIG FIELDS (each block begins with "#Trait")
+;
+; - name
+;     Text (required). Stable English trait identity: Militaristic, Commercial,
+;     Expansionist, Scientific, Religious, Industrious, Agricultural, or Seafaring.
+;     Matching is case-insensitive; this is not a display name.
+;
+; - building_discount_tags
+;     None or a comma-separated list of stable trait names. Selects the BIQ
+;     improvement characteristics that receive building_cost_percent. Matching any
+;     listed tag is sufficient. Great and Small Wonders are always excluded.
+;
+; - building_cost_percent
+;     Integer from 0 to 10000: percent of normal shield cost for matching ordinary
+;     improvements. 100 is normal and 50 is half cost. The normal minimum building
+;     cost still applies. The lowest value among matching possessed profiles wins.
+;
+; - promotion_chance_percent
+;     Integer from 0 to 10000: multiplier on normal post-combat promotion odds.
+;     100 is normal; the original Militaristic value is 200.
+;
+; - optimal_city_number_bonus_percent
+;     Integer from -100 to 10000: percent of the world-size base Optimal City Number
+;     added to OCN. 0 is neutral; the original Commercial value is 25. This is an
+;     additive bonus, not a multiplier whose neutral value is 100.
+;
+; - city_center_food_bonus
+; - city_center_shield_bonus
+; - city_center_commerce_bonus
+;     Three comma-separated integers from -1000 to 1000, ordered town, city,
+;     metropolis. These are additions to the city-center tile, not its final yields.
+;     The original values are Agricultural food 1, 1, 1; Industrious shields
+;     0, 0, 1; and Commercial commerce 0, 2, 3.
+;
+; - starting_scout_count
+;     Integer from 0 to 100: number of Scout-line units granted by this profile at
+;     new-game initialization. The original Expansionist value is 1. The game uses
+;     the ruleset's default Scout or an available upgrade. Not retroactive.
+;
+; - goody_hut_table_bonus
+;     Integer from -20 to 20: adjustment to the goody-hut result table. Positive
+;     values move toward more favorable tables; the original Expansionist value is
+;     1. The final table index is clamped to the nine tables in the executable.
+;
+; - goody_huts_never_barbarians
+;     0/1 or false/true. If true, hostile-barbarian goody-hut results are rejected
+;     and rerolled. The original Expansionist value is true.
+;
+; - goody_huts_allow_free_city
+;     0/1 or false/true. If true, permits the free-city goody-hut result. The
+;     original Expansionist value is true.
+;
+; - free_era_tech_count
+;     Integer from 0 to 100: number of available technologies granted on entering
+;     each new era. The original Scientific value is 1. This does not change BIQ
+;     starting technologies and is not retroactive.
+;
+; - scientific_great_leader_chance_bonus_per_mille
+;     Integer from -1000 to 1000: additive SGL chance bonus in thousandths. 1000 is
+;     100%. The normal base is 30 (3%); the original Scientific bonus is 20, making
+;     5%. The final chance is clamped from 0 to 1000.
+;
+; - anarchy_fixed_turns
+;     Integer from -1 to 1000. -1 uses the normal random non-Religious formula.
+;     The original Religious value is the engine's internal value 2, normally shown
+;     as one turn of Anarchy. The lowest non-negative possessed value wins.
+;
+; - anarchy_length_percent
+;     Integer from 0 to 10000: multiplier applied after the fixed or random Anarchy
+;     length. 100 is unchanged. It also combines with anarchy_length_percent in
+;     default.c3x_config.ini when that legacy option is not 100.
+;
+; - worker_rate_percent
+;     Integer from 0 to 10000: multiplier on worker job strength. 100 is normal;
+;     the original Industrious value is 150. Normal government, technology,
+;     nationality, and unit worker-strength modifiers still apply.
+;
+; - irrigated_desert_food_bonus
+;     Integer from -100 to 100: food added on tiles qualifying for the original
+;     Agricultural irrigated-desert effect. The original value is 1. This field
+;     does not make other terrain or non-irrigated desert qualify.
+;
+; - despotism_fresh_water_food_penalty_exception
+;     0/1 or false/true. If true, a fresh-water city-center tile may keep food that
+;     the government's standard tile penalty would otherwise remove. The original
+;     Agricultural value is true. The no_penalty_exception_for_agri_fresh_water_city_tiles
+;     option in default.c3x_config.ini can disable this exception globally.
+;
+; - sea_unit_move_bonus
+;     Integer from -100 to 100: whole movement points added to sea-class units. The
+;     original Seafaring value is 1. Normal movement scaling is handled by the game.
+;
+; - sea_sinking_chance_per_mille
+; - ocean_sinking_chance_per_mille
+;     Integer -1 or from 0 to 1000: sinking chance when ending a turn on Sea or
+;     Ocean. 0 never sinks, 250 is 25%, and 1000 always sinks. -1 contributes no
+;     override; with no profile override the original neutral chance is 500 (50%).
+;     The original Seafaring value is 250 for both terrain types.
+;
+; - coastal_city_center_commerce_bonus
+;     Integer from -100 to 100: city-center commerce added when an adjacent connected
+;     water body meets this same profile's coastal_city_min_water_tiles. The original
+;     Seafaring value is 1.
+;
+; - coastal_city_min_water_tiles
+;     Integer from 0 to 1000000: minimum connected water-body size for this profile's
+;     coastal-city commerce bonus. The original check is larger than 20 tiles,
+;     represented here by 21.
+;
+; - prefer_coastal_start
+;     0/1 or false/true. Requests a qualifying coastal starting location on a newly
+;     generated map. Existing generated locations are reassigned; this does not
+;     create a qualifying location. The original Seafaring value is true. Not
+;     retroactive.
+;
+; - coastal_start_min_water_tiles
+;     Integer from 0 to 1000000: minimum connected water-body size for this profile's
+;     coastal-start preference. The original check is larger than 20 tiles,
+;     represented here by 21.
+
+#Trait
+name                                                  = Militaristic
+building_discount_tags                                = Militaristic
+building_cost_percent                                 = 50
+promotion_chance_percent                              = 200
+optimal_city_number_bonus_percent                     = 0
+city_center_food_bonus                                = 0, 0, 0
+city_center_shield_bonus                              = 0, 0, 0
+city_center_commerce_bonus                            = 0, 0, 0
+starting_scout_count                                  = 0
+goody_hut_table_bonus                                 = 0
+goody_huts_never_barbarians                           = false
+goody_huts_allow_free_city                            = false
+free_era_tech_count                                   = 0
+scientific_great_leader_chance_bonus_per_mille        = 0
+anarchy_fixed_turns                                   = -1
+anarchy_length_percent                                = 100
+worker_rate_percent                                   = 100
+irrigated_desert_food_bonus                           = 0
+despotism_fresh_water_food_penalty_exception          = false
+sea_unit_move_bonus                                   = 0
+sea_sinking_chance_per_mille                          = -1
+ocean_sinking_chance_per_mille                        = -1
+coastal_city_center_commerce_bonus                    = 0
+coastal_city_min_water_tiles                          = 21
+prefer_coastal_start                                  = false
+coastal_start_min_water_tiles                         = 21
+
+#Trait
+name                                                  = Commercial
+building_discount_tags                                = None
+building_cost_percent                                 = 100
+promotion_chance_percent                              = 100
+optimal_city_number_bonus_percent                     = 25
+city_center_food_bonus                                = 0, 0, 0
+city_center_shield_bonus                              = 0, 0, 0
+city_center_commerce_bonus                            = 0, 2, 3
+starting_scout_count                                  = 0
+goody_hut_table_bonus                                 = 0
+goody_huts_never_barbarians                           = false
+goody_huts_allow_free_city                            = false
+free_era_tech_count                                   = 0
+scientific_great_leader_chance_bonus_per_mille        = 0
+anarchy_fixed_turns                                   = -1
+anarchy_length_percent                                = 100
+worker_rate_percent                                   = 100
+irrigated_desert_food_bonus                           = 0
+despotism_fresh_water_food_penalty_exception          = false
+sea_unit_move_bonus                                   = 0
+sea_sinking_chance_per_mille                          = -1
+ocean_sinking_chance_per_mille                        = -1
+coastal_city_center_commerce_bonus                    = 0
+coastal_city_min_water_tiles                          = 21
+prefer_coastal_start                                  = false
+coastal_start_min_water_tiles                         = 21
+
+#Trait
+name                                                  = Expansionist
+building_discount_tags                                = None
+building_cost_percent                                 = 100
+promotion_chance_percent                              = 100
+optimal_city_number_bonus_percent                     = 0
+city_center_food_bonus                                = 0, 0, 0
+city_center_shield_bonus                              = 0, 0, 0
+city_center_commerce_bonus                            = 0, 0, 0
+starting_scout_count                                  = 1
+goody_hut_table_bonus                                 = 1
+goody_huts_never_barbarians                           = true
+goody_huts_allow_free_city                            = true
+free_era_tech_count                                   = 0
+scientific_great_leader_chance_bonus_per_mille        = 0
+anarchy_fixed_turns                                   = -1
+anarchy_length_percent                                = 100
+worker_rate_percent                                   = 100
+irrigated_desert_food_bonus                           = 0
+despotism_fresh_water_food_penalty_exception          = false
+sea_unit_move_bonus                                   = 0
+sea_sinking_chance_per_mille                          = -1
+ocean_sinking_chance_per_mille                        = -1
+coastal_city_center_commerce_bonus                    = 0
+coastal_city_min_water_tiles                          = 21
+prefer_coastal_start                                  = false
+coastal_start_min_water_tiles                         = 21
+
+#Trait
+name                                                  = Scientific
+building_discount_tags                                = Scientific
+building_cost_percent                                 = 50
+promotion_chance_percent                              = 100
+optimal_city_number_bonus_percent                     = 0
+city_center_food_bonus                                = 0, 0, 0
+city_center_shield_bonus                              = 0, 0, 0
+city_center_commerce_bonus                            = 0, 0, 0
+starting_scout_count                                  = 0
+goody_hut_table_bonus                                 = 0
+goody_huts_never_barbarians                           = false
+goody_huts_allow_free_city                            = false
+free_era_tech_count                                   = 1
+scientific_great_leader_chance_bonus_per_mille        = 20
+anarchy_fixed_turns                                   = -1
+anarchy_length_percent                                = 100
+worker_rate_percent                                   = 100
+irrigated_desert_food_bonus                           = 0
+despotism_fresh_water_food_penalty_exception          = false
+sea_unit_move_bonus                                   = 0
+sea_sinking_chance_per_mille                          = -1
+ocean_sinking_chance_per_mille                        = -1
+coastal_city_center_commerce_bonus                    = 0
+coastal_city_min_water_tiles                          = 21
+prefer_coastal_start                                  = false
+coastal_start_min_water_tiles                         = 21
+
+#Trait
+name                                                  = Religious
+building_discount_tags                                = Religious
+building_cost_percent                                 = 50
+promotion_chance_percent                              = 100
+optimal_city_number_bonus_percent                     = 0
+city_center_food_bonus                                = 0, 0, 0
+city_center_shield_bonus                              = 0, 0, 0
+city_center_commerce_bonus                            = 0, 0, 0
+starting_scout_count                                  = 0
+goody_hut_table_bonus                                 = 0
+goody_huts_never_barbarians                           = false
+goody_huts_allow_free_city                            = false
+free_era_tech_count                                   = 0
+scientific_great_leader_chance_bonus_per_mille        = 0
+anarchy_fixed_turns                                   = 2
+anarchy_length_percent                                = 100
+worker_rate_percent                                   = 100
+irrigated_desert_food_bonus                           = 0
+despotism_fresh_water_food_penalty_exception          = false
+sea_unit_move_bonus                                   = 0
+sea_sinking_chance_per_mille                          = -1
+ocean_sinking_chance_per_mille                        = -1
+coastal_city_center_commerce_bonus                    = 0
+coastal_city_min_water_tiles                          = 21
+prefer_coastal_start                                  = false
+coastal_start_min_water_tiles                         = 21
+
+#Trait
+name                                                  = Industrious
+building_discount_tags                                = None
+building_cost_percent                                 = 100
+promotion_chance_percent                              = 100
+optimal_city_number_bonus_percent                     = 0
+city_center_food_bonus                                = 0, 0, 0
+city_center_shield_bonus                              = 0, 0, 1
+city_center_commerce_bonus                            = 0, 0, 0
+starting_scout_count                                  = 0
+goody_hut_table_bonus                                 = 0
+goody_huts_never_barbarians                           = false
+goody_huts_allow_free_city                            = false
+free_era_tech_count                                   = 0
+scientific_great_leader_chance_bonus_per_mille        = 0
+anarchy_fixed_turns                                   = -1
+anarchy_length_percent                                = 100
+worker_rate_percent                                   = 150
+irrigated_desert_food_bonus                           = 0
+despotism_fresh_water_food_penalty_exception          = false
+sea_unit_move_bonus                                   = 0
+sea_sinking_chance_per_mille                          = -1
+ocean_sinking_chance_per_mille                        = -1
+coastal_city_center_commerce_bonus                    = 0
+coastal_city_min_water_tiles                          = 21
+prefer_coastal_start                                  = false
+coastal_start_min_water_tiles                         = 21
+
+#Trait
+name                                                  = Agricultural
+building_discount_tags                                = Agricultural
+building_cost_percent                                 = 50
+promotion_chance_percent                              = 100
+optimal_city_number_bonus_percent                     = 0
+city_center_food_bonus                                = 1, 1, 1
+city_center_shield_bonus                              = 0, 0, 0
+city_center_commerce_bonus                            = 0, 0, 0
+starting_scout_count                                  = 0
+goody_hut_table_bonus                                 = 0
+goody_huts_never_barbarians                           = false
+goody_huts_allow_free_city                            = false
+free_era_tech_count                                   = 0
+scientific_great_leader_chance_bonus_per_mille        = 0
+anarchy_fixed_turns                                   = -1
+anarchy_length_percent                                = 100
+worker_rate_percent                                   = 100
+irrigated_desert_food_bonus                           = 1
+despotism_fresh_water_food_penalty_exception          = true
+sea_unit_move_bonus                                   = 0
+sea_sinking_chance_per_mille                          = -1
+ocean_sinking_chance_per_mille                        = -1
+coastal_city_center_commerce_bonus                    = 0
+coastal_city_min_water_tiles                          = 21
+prefer_coastal_start                                  = false
+coastal_start_min_water_tiles                         = 21
+
+#Trait
+name                                                  = Seafaring
+building_discount_tags                                = Seafaring
+building_cost_percent                                 = 50
+promotion_chance_percent                              = 100
+optimal_city_number_bonus_percent                     = 0
+city_center_food_bonus                                = 0, 0, 0
+city_center_shield_bonus                              = 0, 0, 0
+city_center_commerce_bonus                            = 0, 0, 0
+starting_scout_count                                  = 0
+goody_hut_table_bonus                                 = 0
+goody_huts_never_barbarians                           = false
+goody_huts_allow_free_city                            = false
+free_era_tech_count                                   = 0
+scientific_great_leader_chance_bonus_per_mille        = 0
+anarchy_fixed_turns                                   = -1
+anarchy_length_percent                                = 100
+worker_rate_percent                                   = 100
+irrigated_desert_food_bonus                           = 0
+despotism_fresh_water_food_penalty_exception          = false
+sea_unit_move_bonus                                   = 1
+sea_sinking_chance_per_mille                          = 250
+ocean_sinking_chance_per_mille                        = 250
+coastal_city_center_commerce_bonus                    = 1
+coastal_city_min_water_tiles                          = 21
+prefer_coastal_start                                  = true
+coastal_start_min_water_tiles                         = 21

@@ -913,7 +913,10 @@ ENTRY_POINT ()
 		struct civ_prog_object const * obj = &civ_prog_objects[n];
 		if (obj->job == OJ_DEFINE) {
 			char val[1000];
-			snprintf (val, sizeof val, "((%s)%d)", obj->type, obj->addr);
+			// 0x0FF is the per-executable "off" sentinel.  Define disabled
+			// objects as null so injected code can feature-detect them without
+			// accidentally treating address 0xFF as a real pointer.
+			snprintf (val, sizeof val, "((%s)%d)", obj->type, obj->addr == 0x0FF ? 0 : obj->addr);
 			val[(sizeof val) - 1] = '\0';
 			tcc__define_symbol (tcc, obj->name, val);
 		}
@@ -928,7 +931,8 @@ ENTRY_POINT ()
 	int inleads_capacity; {
 		int count = 0;
 		for (int n = 0; n < count_civ_prog_objects; n++)
-			if (civ_prog_objects[n].job == OJ_INLEAD)
+			if ((civ_prog_objects[n].job == OJ_INLEAD) &&
+			    (civ_prog_objects[n].addr != 0x0FF))
 				count++;
 		inleads_capacity = count + 40; // Allocate some extra space for various uses
 	}
@@ -957,6 +961,10 @@ ENTRY_POINT ()
 
 		// Initialize inlead
 		if (obj->job == OJ_INLEAD) {
+			if (obj->addr == 0x0FF) {
+				tcc__define_symbol (tcc, obj->name, temp_format ("((%s)0)", obj->type));
+				continue;
+			}
 			ASSERT (i_next_free_inlead < inleads_capacity);
 			struct inlead * inlead = &inleads[i_next_free_inlead++];
 			int func_addr = obj->addr;
@@ -1079,7 +1087,8 @@ ENTRY_POINT ()
 	for (int n = 0; n < count_civ_prog_objects; n++) {
 		struct civ_prog_object const * obj = &civ_prog_objects[n];
 		if ((obj->job != OJ_IGNORE) &&
-		    ! ((obj->job == OJ_REPL_CALL) && (obj->addr == 0x0FF))) { // Special address 0x0FF ("OFF") ignores call repl on a per-exe basis
+		    ! (((obj->job == OJ_REPL_CALL) || (obj->job == OJ_INLEAD) || (obj->job == OJ_DEFINE)) &&
+		       (obj->addr == 0x0FF))) { // Special address 0x0FF ("OFF") ignores this object on a per-exe basis
 			ASSERT ((obj->addr != 0) || (0 == strcmp (obj->name, "exe_version_index")));
 
 			if (obj->job == OJ_INLEAD)

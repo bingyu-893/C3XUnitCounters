@@ -263,6 +263,63 @@ struct counter_rule {
 	int    enemy_bombard_pct;
 };
 
+// Civilization trait identity remains stored in Race.Bonuses.  These profiles
+// only describe the effects granted by each of the eight original trait bits.
+// Keeping the two concepts separate lets configs move effects between traits
+// without changing Civilopedia identity, golden-age matching, or BIQ data.
+enum {
+	COUNT_CIV_TRAITS = 8,
+	COUNT_TRAIT_CITY_SIZES = 3
+};
+
+enum trait_city_size {
+	TCS_TOWN = 0,
+	TCS_CITY = 1,
+	TCS_METROPOLIS = 2
+};
+
+#define TRAIT_NO_FIXED_ANARCHY (-1)
+#define TRAIT_NO_SINK_CHANCE_OVERRIDE (-1)
+
+struct trait_profile {
+	// Ordinary improvements with any of these ITC_* characteristics receive
+	// building_cost_percent. Wonders and small wonders remain excluded by the
+	// effect implementation, as in the original game.
+	unsigned int building_discount_characteristics;
+	int building_cost_percent;
+
+	int promotion_chance_percent;
+	int optimal_city_number_bonus_percent;
+	int city_center_food_bonus[COUNT_TRAIT_CITY_SIZES];
+	int city_center_shield_bonus[COUNT_TRAIT_CITY_SIZES];
+	int city_center_commerce_bonus[COUNT_TRAIT_CITY_SIZES];
+
+	int starting_scout_count;
+	int goody_hut_table_bonus;
+	bool goody_huts_never_barbarians;
+	bool goody_huts_allow_free_city;
+
+	int free_era_tech_count;
+	int scientific_great_leader_chance_bonus_per_mille;
+
+	// TRAIT_NO_FIXED_ANARCHY means to use the normal random formula. The
+	// percentage is then an independent multiplier (100 = unchanged).
+	int anarchy_fixed_turns;
+	int anarchy_length_percent;
+	int worker_rate_percent;
+
+	int irrigated_desert_food_bonus;
+	bool despotism_fresh_water_food_penalty_exception;
+
+	int sea_unit_move_bonus;
+	int sea_sinking_chance_per_mille;
+	int ocean_sinking_chance_per_mille;
+	int coastal_city_center_commerce_bonus;
+	int coastal_city_min_water_tiles;
+	bool prefer_coastal_start;
+	int coastal_start_min_water_tiles;
+};
+
 struct c3x_config {
 	bool enable_stack_bombard;
 	bool enable_disorder_warning;
@@ -1616,6 +1673,41 @@ struct injected_state {
 	long long time_spent_filling_roads;
 
 	struct c3x_config current_config;
+
+	// Runtime effects for Race.Bonuses bits 0 through 7. These are reset to
+	// hard-coded vanilla values, then sparsely overlaid by the dedicated trait
+	// config files whenever a scenario is loaded.
+	struct trait_profile trait_profiles[COUNT_CIV_TRAITS];
+	// Recomputed after the layered trait profile configs are loaded. The hash
+	// is deterministic across supported executables and does not include C
+	// struct padding.
+	bool trait_profiles_are_vanilla;
+	unsigned int trait_profiles_hash;
+	char trait_profile_config_paths[3][MAX_PATH];
+	int trait_profile_config_count;
+	// Context for narrowly targeted calls inside original trait-effect
+	// functions. These are saved/restored by their outer inlead wrappers so
+	// nested calls cannot leak one civilization's profile into another.
+	Unit * trait_score_kill_unit;
+	Unit * trait_begin_turn_unit;
+	Leader * trait_unlock_technology_leader;
+	Leader * trait_goody_hut_receiver_leader;
+	// Set after custom coastal-start preferences have been applied to the
+	// current game's complete Starting_Locations permutation. Reset whenever
+	// trait profiles are reloaded.
+	bool trait_coastal_start_assignment_done;
+	// Set at the actual map-generation boundary only when all five native
+	// coastal-start instruction sites were recognized and safely suppressed.
+	bool trait_custom_coastal_start_runtime_enabled;
+	struct {
+		Race * race;
+		unsigned int bonuses;
+	} trait_identity_overrides[8];
+	int trait_identity_override_depth;
+	bool trait_multiplayer_disable_logged;
+	bool saved_trait_profiles_hash_present;
+	unsigned int saved_trait_profiles_hash;
+	bool trait_profiles_save_mismatch_reported;
 
 	// Keeps a record of all configs currently loaded. Useful to know. "name" is the file name for configs that come from files, which is all of
 	// them except for the base config, whose name is "(base)".

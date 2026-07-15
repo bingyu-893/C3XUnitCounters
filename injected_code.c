@@ -263,6 +263,28 @@ int count_utilized_neighborhoods_in_city_radius (City * city);
 char * copy_trimmed_string_or_null (struct string_slice const * slice, int remove_quotes);
 bool city_has_resource_r (City * city, int resource_id, int max_generated_resource_id);
 
+// Civilization trait profile configuration. Race.Bonuses remains the source
+// of trait identity; these functions only manage the effect profiles.
+struct trait_profile const * get_trait_profile (int trait_id);
+bool is_vanilla_trait_profile (int trait_id, struct trait_profile const * profile);
+bool aggregate_trait_profiles_for_mask (unsigned int trait_mask, unsigned int improvement_characteristics, struct trait_profile * out);
+bool aggregate_trait_profiles_for_race (Race const * race, unsigned int improvement_characteristics, struct trait_profile * out);
+bool aggregate_trait_profiles_for_leader (Leader const * leader, unsigned int improvement_characteristics, struct trait_profile * out);
+unsigned int get_trait_identity_mask_for_race (Race const * race);
+unsigned int get_trait_identity_mask_for_leader (Leader const * leader);
+bool push_trait_identity_override (Race * race, unsigned int bonuses);
+void pop_trait_identity_override (bool was_pushed);
+unsigned int compute_trait_profiles_hash (void);
+void refresh_trait_profile_metadata (void);
+bool trait_profile_effects_are_active (void);
+void __fastcall patch_Unit_score_kill (Unit * this, int edx, Unit * victim, bool was_attacking);
+void __fastcall patch_Leader_unlock_technology (Leader * this, int edx, int tech_id, bool param_2, bool param_3, bool param_4);
+Unit * __fastcall patch_Leader_spawn_unit (Leader * this, int edx, int type_id, int x, int y, int barb_tribe_id, int id, bool param_6, LeaderKind leader_kind, int race_id);
+void reset_trait_profiles_to_vanilla (void);
+void load_trait_profile_configs (void);
+bool line_is_empty_or_comment (struct string_slice const * trimmed);
+bool file_exists_at_path (char const * path);
+
 struct pause_for_popup {
 	bool done; // Set to true to exit for loop
 	bool redundant; // If true, this pause would overlap a previous one and so should not be counted
@@ -686,6 +708,7 @@ void
 reset_to_base_config ()
 {
 	struct c3x_config * cc = &is->current_config;
+	reset_trait_profiles_to_vanilla ();
 
 	for (int n = 0; n < ARRAY_LEN (cc->limit_units_per_tile); n++)
 		cc->limit_units_per_tile[n] = 0;
@@ -10680,6 +10703,1338 @@ handle_district_definition_key (struct parsed_district_definition * def,
 		add_unrecognized_key_error (unrecognized_keys, line_number, key);
 }
 
+// =======================================
+// ||                                   ||
+// ||  CIVILIZATION TRAIT CONFIGURATION ||
+// ||                                   ||
+// =======================================
+
+struct trait_profile const *
+get_trait_profile (int trait_id)
+{
+	if ((trait_id < 0) || (trait_id >= COUNT_CIV_TRAITS))
+		return NULL;
+	return &is->trait_profiles[trait_id];
+}
+
+static bool
+pointer_is_array_element (void const * pointer, void const * array,
+			  size_t element_size, int element_count)
+{
+	if ((pointer == NULL) || (array == NULL) ||
+	    (element_size == 0) || (element_count <= 0))
+		return false;
+	if ((size_t)element_count > ((size_t)-1) / element_size)
+		return false;
+	size_t pointer_address = (size_t)pointer;
+	size_t array_address = (size_t)array;
+	if (pointer_address < array_address)
+		return false;
+	size_t offset = pointer_address - array_address;
+	return (offset < element_size * (size_t)element_count) &&
+	       ((offset % element_size) == 0);
+}
+
+// Returns true only for Race objects in the currently loaded BIC. Besides
+// making bad IDs harmless, this avoids dereferencing arbitrary Race pointers
+// passed by a future hook by mistake. The range/alignment test is constant
+// time because these helpers may be used by per-tile yield hooks.
+static bool
+is_loaded_race_pointer (Race const * race)
+{
+	if ((race == NULL) || (p_bic_data == NULL) ||
+	    (p_bic_data->Races == NULL) || (p_bic_data->RacesCount <= 0))
+		return false;
+	return pointer_is_array_element (race, p_bic_data->Races,
+					 sizeof (Race), p_bic_data->RacesCount);
+}
+
+static bool
+is_loaded_leader_pointer (Leader const * leader)
+{
+	if ((leader == NULL) || (leaders == NULL))
+		return false;
+	// The executable owns a fixed array of 32 Leader objects, including the
+	// barbarian slot and unused player slots.
+	return pointer_is_array_element (leader, leaders, sizeof (Leader), 32);
+}
+
+static void
+init_neutral_aggregated_trait_profile (struct trait_profile * profile)
+{
+	memset (profile, 0, sizeof *profile);
+	profile->building_cost_percent = 100;
+	profile->promotion_chance_percent = 100;
+	profile->anarchy_fixed_turns = TRAIT_NO_FIXED_ANARCHY;
+	profile->anarchy_length_percent = 100;
+	profile->worker_rate_percent = 100;
+	profile->sea_sinking_chance_per_mille = TRAIT_NO_SINK_CHANCE_OVERRIDE;
+	profile->ocean_sinking_chance_per_mille = TRAIT_NO_SINK_CHANCE_OVERRIDE;
+
+	// These two thresholds belong to the individual effect which contributed
+	// them. They are deliberately not aggregated: all neutral vanilla profiles
+	// contain 21, so addition would turn a normal two-trait civilization's
+	// threshold into 42. Callers must inspect each possessed profile when
+	// applying coastal commerce or coastal-start preference.
+	profile->coastal_city_min_water_tiles = 0;
+	profile->coastal_start_min_water_tiles = 0;
+}
+
+bool
+aggregate_trait_profiles_for_mask (unsigned int trait_mask,
+				   unsigned int improvement_characteristics,
+				   struct trait_profile * out)
+{
+	if (out == NULL)
+		return false;
+	init_neutral_aggregated_trait_profile (out);
+
+	bool have_matching_building_cost = false;
+	for (int trait_id = 0; trait_id < COUNT_CIV_TRAITS; trait_id++) {
+		if ((trait_mask & (1u << trait_id)) == 0)
+			continue;
+		struct trait_profile const * profile = get_trait_profile (trait_id);
+		if (profile == NULL)
+			continue;
+
+		out->building_discount_characteristics |= profile->building_discount_characteristics;
+		if (((profile->building_discount_characteristics & improvement_characteristics) != 0) &&
+		    ((! have_matching_building_cost) ||
+		     (profile->building_cost_percent < out->building_cost_percent))) {
+			out->building_cost_percent = profile->building_cost_percent;
+			have_matching_building_cost = true;
+		}
+
+		out->promotion_chance_percent += profile->promotion_chance_percent - 100;
+		out->optimal_city_number_bonus_percent += profile->optimal_city_number_bonus_percent;
+		for (int city_size = 0; city_size < COUNT_TRAIT_CITY_SIZES; city_size++) {
+			out->city_center_food_bonus[city_size] += profile->city_center_food_bonus[city_size];
+			out->city_center_shield_bonus[city_size] += profile->city_center_shield_bonus[city_size];
+			out->city_center_commerce_bonus[city_size] += profile->city_center_commerce_bonus[city_size];
+		}
+
+		out->starting_scout_count += profile->starting_scout_count;
+		out->goody_hut_table_bonus += profile->goody_hut_table_bonus;
+		out->goody_huts_never_barbarians =
+			out->goody_huts_never_barbarians || profile->goody_huts_never_barbarians;
+		out->goody_huts_allow_free_city =
+			out->goody_huts_allow_free_city || profile->goody_huts_allow_free_city;
+
+		out->free_era_tech_count += profile->free_era_tech_count;
+		out->scientific_great_leader_chance_bonus_per_mille +=
+			profile->scientific_great_leader_chance_bonus_per_mille;
+
+		if ((profile->anarchy_fixed_turns >= 0) &&
+		    ((out->anarchy_fixed_turns < 0) ||
+		     (profile->anarchy_fixed_turns < out->anarchy_fixed_turns)))
+			out->anarchy_fixed_turns = profile->anarchy_fixed_turns;
+		out->anarchy_length_percent += profile->anarchy_length_percent - 100;
+		out->worker_rate_percent += profile->worker_rate_percent - 100;
+
+		out->irrigated_desert_food_bonus += profile->irrigated_desert_food_bonus;
+		out->despotism_fresh_water_food_penalty_exception =
+			out->despotism_fresh_water_food_penalty_exception ||
+			profile->despotism_fresh_water_food_penalty_exception;
+
+		out->sea_unit_move_bonus += profile->sea_unit_move_bonus;
+		if ((profile->sea_sinking_chance_per_mille >= 0) &&
+		    ((out->sea_sinking_chance_per_mille < 0) ||
+		     (profile->sea_sinking_chance_per_mille < out->sea_sinking_chance_per_mille)))
+			out->sea_sinking_chance_per_mille = profile->sea_sinking_chance_per_mille;
+		if ((profile->ocean_sinking_chance_per_mille >= 0) &&
+		    ((out->ocean_sinking_chance_per_mille < 0) ||
+		     (profile->ocean_sinking_chance_per_mille < out->ocean_sinking_chance_per_mille)))
+			out->ocean_sinking_chance_per_mille = profile->ocean_sinking_chance_per_mille;
+		out->coastal_city_center_commerce_bonus += profile->coastal_city_center_commerce_bonus;
+		out->prefer_coastal_start = out->prefer_coastal_start || profile->prefer_coastal_start;
+	}
+
+	// No possessed profile matched this improvement, so 100 remains the
+	// neutral building cost even if other possessed traits use a higher value.
+	if (! have_matching_building_cost)
+		out->building_cost_percent = 100;
+	return true;
+}
+
+unsigned int
+get_trait_identity_mask_for_race (Race const * race)
+{
+	if (! is_loaded_race_pointer (race))
+		return 0;
+	for (int n = is->trait_identity_override_depth - 1; n >= 0; n--)
+		if (is->trait_identity_overrides[n].race == race)
+			return is->trait_identity_overrides[n].bonuses & 0xFFu;
+	return (unsigned int)race->Bonuses & 0xFFu;
+}
+
+unsigned int
+get_trait_identity_mask_for_leader (Leader const * leader)
+{
+	if ((! is_loaded_leader_pointer (leader)) || (p_bic_data == NULL) ||
+	    (leader->RaceID < 0) || (leader->RaceID >= p_bic_data->RacesCount))
+		return 0;
+	return get_trait_identity_mask_for_race (&p_bic_data->Races[leader->RaceID]);
+}
+
+bool
+push_trait_identity_override (Race * race, unsigned int bonuses)
+{
+	int depth = is->trait_identity_override_depth;
+	if ((! is_loaded_race_pointer (race)) ||
+	    (depth < 0) || (depth >= ARRAY_LEN (is->trait_identity_overrides)))
+		return false;
+	is->trait_identity_overrides[depth].race = race;
+	is->trait_identity_overrides[depth].bonuses = bonuses & 0xFFu;
+	is->trait_identity_override_depth = depth + 1;
+	return true;
+}
+
+void
+pop_trait_identity_override (bool was_pushed)
+{
+	if (was_pushed && (is->trait_identity_override_depth > 0)) {
+		is->trait_identity_override_depth--;
+		is->trait_identity_overrides[is->trait_identity_override_depth].race = NULL;
+		is->trait_identity_overrides[is->trait_identity_override_depth].bonuses = 0;
+	}
+}
+
+bool
+aggregate_trait_profiles_for_race (Race const * race,
+				   unsigned int improvement_characteristics,
+				   struct trait_profile * out)
+{
+	if (out == NULL)
+		return false;
+	if (! is_loaded_race_pointer (race)) {
+		init_neutral_aggregated_trait_profile (out);
+		return false;
+	}
+	return aggregate_trait_profiles_for_mask (get_trait_identity_mask_for_race (race),
+					  improvement_characteristics, out);
+}
+
+bool
+aggregate_trait_profiles_for_leader (Leader const * leader,
+				     unsigned int improvement_characteristics,
+				     struct trait_profile * out)
+{
+	if (out == NULL)
+		return false;
+	if ((! is_loaded_leader_pointer (leader)) || (p_bic_data == NULL) ||
+	    (leader->RaceID < 0) || (leader->RaceID >= p_bic_data->RacesCount)) {
+		init_neutral_aggregated_trait_profile (out);
+		return false;
+	}
+	return aggregate_trait_profiles_for_race (&p_bic_data->Races[leader->RaceID],
+					    improvement_characteristics, out);
+}
+
+bool
+is_vanilla_trait_profile (int trait_id, struct trait_profile const * profile)
+{
+	if ((trait_id < 0) || (trait_id >= COUNT_CIV_TRAITS) || (profile == NULL))
+		return false;
+
+	unsigned int building_discount_characteristics = 0;
+	int building_cost_percent = 100;
+	int promotion_chance_percent = 100;
+	int optimal_city_number_bonus_percent = 0;
+	int center_food_town = 0, center_food_city = 0, center_food_metro = 0;
+	int center_shield_town = 0, center_shield_city = 0, center_shield_metro = 0;
+	int center_commerce_town = 0, center_commerce_city = 0, center_commerce_metro = 0;
+	int starting_scout_count = 0;
+	int goody_hut_table_bonus = 0;
+	bool goody_huts_never_barbarians = false;
+	bool goody_huts_allow_free_city = false;
+	int free_era_tech_count = 0;
+	int scientific_great_leader_chance_bonus_per_mille = 0;
+	int anarchy_fixed_turns = TRAIT_NO_FIXED_ANARCHY;
+	int anarchy_length_percent = 100;
+	int worker_rate_percent = 100;
+	int irrigated_desert_food_bonus = 0;
+	bool despotism_fresh_water_food_penalty_exception = false;
+	int sea_unit_move_bonus = 0;
+	int sea_sinking_chance_per_mille = TRAIT_NO_SINK_CHANCE_OVERRIDE;
+	int ocean_sinking_chance_per_mille = TRAIT_NO_SINK_CHANCE_OVERRIDE;
+	int coastal_city_center_commerce_bonus = 0;
+	int coastal_city_min_water_tiles = 21;
+	bool prefer_coastal_start = false;
+	int coastal_start_min_water_tiles = 21;
+
+	switch (trait_id) {
+	case RB_Militaristic:
+		building_discount_characteristics = ITC_Militaristic;
+		building_cost_percent = 50;
+		promotion_chance_percent = 200;
+		break;
+	case RB_Commercial:
+		optimal_city_number_bonus_percent = 25;
+		center_commerce_city = 2;
+		center_commerce_metro = 3;
+		break;
+	case RB_Expansionist:
+		starting_scout_count = 1;
+		goody_hut_table_bonus = 1;
+		goody_huts_never_barbarians = true;
+		goody_huts_allow_free_city = true;
+		break;
+	case RB_Scientific:
+		building_discount_characteristics = ITC_Scientific;
+		building_cost_percent = 50;
+		free_era_tech_count = 1;
+		scientific_great_leader_chance_bonus_per_mille = 20;
+		break;
+	case RB_Religious:
+		building_discount_characteristics = ITC_Religious;
+		building_cost_percent = 50;
+		anarchy_fixed_turns = 2;
+		break;
+	case RB_Industrious:
+		center_shield_metro = 1;
+		worker_rate_percent = 150;
+		break;
+	case RB_Agricultural:
+		building_discount_characteristics = ITC_Agricultural;
+		building_cost_percent = 50;
+		center_food_town = 1;
+		center_food_city = 1;
+		center_food_metro = 1;
+		irrigated_desert_food_bonus = 1;
+		despotism_fresh_water_food_penalty_exception = true;
+		break;
+	case RB_Seafaring:
+		building_discount_characteristics = ITC_Seafaring;
+		building_cost_percent = 50;
+		sea_unit_move_bonus = 1;
+		sea_sinking_chance_per_mille = 250;
+		ocean_sinking_chance_per_mille = 250;
+		coastal_city_center_commerce_bonus = 1;
+		prefer_coastal_start = true;
+		break;
+	default:
+		return false;
+	}
+
+	// Do not replace this with memcmp: bool representation and struct padding
+	// differ between compilers, while this predicate is also the fast-path gate
+	// that preserves the original executable's exact behavior.
+	return
+		(profile->building_discount_characteristics == building_discount_characteristics) &&
+		(profile->building_cost_percent == building_cost_percent) &&
+		(profile->promotion_chance_percent == promotion_chance_percent) &&
+		(profile->optimal_city_number_bonus_percent == optimal_city_number_bonus_percent) &&
+		(profile->city_center_food_bonus[TCS_TOWN] == center_food_town) &&
+		(profile->city_center_food_bonus[TCS_CITY] == center_food_city) &&
+		(profile->city_center_food_bonus[TCS_METROPOLIS] == center_food_metro) &&
+		(profile->city_center_shield_bonus[TCS_TOWN] == center_shield_town) &&
+		(profile->city_center_shield_bonus[TCS_CITY] == center_shield_city) &&
+		(profile->city_center_shield_bonus[TCS_METROPOLIS] == center_shield_metro) &&
+		(profile->city_center_commerce_bonus[TCS_TOWN] == center_commerce_town) &&
+		(profile->city_center_commerce_bonus[TCS_CITY] == center_commerce_city) &&
+		(profile->city_center_commerce_bonus[TCS_METROPOLIS] == center_commerce_metro) &&
+		(profile->starting_scout_count == starting_scout_count) &&
+		(profile->goody_hut_table_bonus == goody_hut_table_bonus) &&
+		(profile->goody_huts_never_barbarians == goody_huts_never_barbarians) &&
+		(profile->goody_huts_allow_free_city == goody_huts_allow_free_city) &&
+		(profile->free_era_tech_count == free_era_tech_count) &&
+		(profile->scientific_great_leader_chance_bonus_per_mille ==
+		 scientific_great_leader_chance_bonus_per_mille) &&
+		(profile->anarchy_fixed_turns == anarchy_fixed_turns) &&
+		(profile->anarchy_length_percent == anarchy_length_percent) &&
+		(profile->worker_rate_percent == worker_rate_percent) &&
+		(profile->irrigated_desert_food_bonus == irrigated_desert_food_bonus) &&
+		(profile->despotism_fresh_water_food_penalty_exception ==
+		 despotism_fresh_water_food_penalty_exception) &&
+		(profile->sea_unit_move_bonus == sea_unit_move_bonus) &&
+		(profile->sea_sinking_chance_per_mille == sea_sinking_chance_per_mille) &&
+		(profile->ocean_sinking_chance_per_mille == ocean_sinking_chance_per_mille) &&
+		(profile->coastal_city_center_commerce_bonus == coastal_city_center_commerce_bonus) &&
+		(profile->coastal_city_min_water_tiles == coastal_city_min_water_tiles) &&
+		(profile->prefer_coastal_start == prefer_coastal_start) &&
+		(profile->coastal_start_min_water_tiles == coastal_start_min_water_tiles);
+}
+
+static unsigned int
+hash_trait_u32_le (unsigned int hash, unsigned int value)
+{
+	// FNV-1a, serialized explicitly as four little-endian bytes. This is
+	// independent of target endianness, alignment, and struct padding.
+	for (int byte_index = 0; byte_index < 4; byte_index++) {
+		hash ^= value & 0xFFu;
+		hash *= 16777619u;
+		value >>= 8;
+	}
+	return hash;
+}
+
+unsigned int
+compute_trait_profiles_hash (void)
+{
+	unsigned int hash = 2166136261u;
+	// Schema marker "TRP1". A field-order change must use a new marker.
+	hash = hash_trait_u32_le (hash, 0x31505254u);
+	for (int trait_id = 0; trait_id < COUNT_CIV_TRAITS; trait_id++) {
+		struct trait_profile const * profile = &is->trait_profiles[trait_id];
+		hash = hash_trait_u32_le (hash, (unsigned int)trait_id);
+		hash = hash_trait_u32_le (hash, profile->building_discount_characteristics);
+		hash = hash_trait_u32_le (hash, (unsigned int)profile->building_cost_percent);
+		hash = hash_trait_u32_le (hash, (unsigned int)profile->promotion_chance_percent);
+		hash = hash_trait_u32_le (hash, (unsigned int)profile->optimal_city_number_bonus_percent);
+		for (int city_size = 0; city_size < COUNT_TRAIT_CITY_SIZES; city_size++)
+			hash = hash_trait_u32_le (hash, (unsigned int)profile->city_center_food_bonus[city_size]);
+		for (int city_size = 0; city_size < COUNT_TRAIT_CITY_SIZES; city_size++)
+			hash = hash_trait_u32_le (hash, (unsigned int)profile->city_center_shield_bonus[city_size]);
+		for (int city_size = 0; city_size < COUNT_TRAIT_CITY_SIZES; city_size++)
+			hash = hash_trait_u32_le (hash, (unsigned int)profile->city_center_commerce_bonus[city_size]);
+		hash = hash_trait_u32_le (hash, (unsigned int)profile->starting_scout_count);
+		hash = hash_trait_u32_le (hash, (unsigned int)profile->goody_hut_table_bonus);
+		hash = hash_trait_u32_le (hash, profile->goody_huts_never_barbarians ? 1u : 0u);
+		hash = hash_trait_u32_le (hash, profile->goody_huts_allow_free_city ? 1u : 0u);
+		hash = hash_trait_u32_le (hash, (unsigned int)profile->free_era_tech_count);
+		hash = hash_trait_u32_le (hash, (unsigned int)profile->scientific_great_leader_chance_bonus_per_mille);
+		hash = hash_trait_u32_le (hash, (unsigned int)profile->anarchy_fixed_turns);
+		hash = hash_trait_u32_le (hash, (unsigned int)profile->anarchy_length_percent);
+		hash = hash_trait_u32_le (hash, (unsigned int)profile->worker_rate_percent);
+		hash = hash_trait_u32_le (hash, (unsigned int)profile->irrigated_desert_food_bonus);
+		hash = hash_trait_u32_le (hash, profile->despotism_fresh_water_food_penalty_exception ? 1u : 0u);
+		hash = hash_trait_u32_le (hash, (unsigned int)profile->sea_unit_move_bonus);
+		hash = hash_trait_u32_le (hash, (unsigned int)profile->sea_sinking_chance_per_mille);
+		hash = hash_trait_u32_le (hash, (unsigned int)profile->ocean_sinking_chance_per_mille);
+		hash = hash_trait_u32_le (hash, (unsigned int)profile->coastal_city_center_commerce_bonus);
+		hash = hash_trait_u32_le (hash, (unsigned int)profile->coastal_city_min_water_tiles);
+		hash = hash_trait_u32_le (hash, profile->prefer_coastal_start ? 1u : 0u);
+		hash = hash_trait_u32_le (hash, (unsigned int)profile->coastal_start_min_water_tiles);
+	}
+	return hash;
+}
+
+void
+refresh_trait_profile_metadata (void)
+{
+	is->trait_profiles_are_vanilla = true;
+	for (int trait_id = 0; trait_id < COUNT_CIV_TRAITS; trait_id++)
+		if (! is_vanilla_trait_profile (trait_id, &is->trait_profiles[trait_id])) {
+			is->trait_profiles_are_vanilla = false;
+			break;
+		}
+	is->trait_profiles_hash = compute_trait_profiles_hash ();
+}
+
+bool
+trait_profile_effects_are_active (void)
+{
+	if (is->trait_profiles_are_vanilla)
+		return false;
+
+	// C3X currently has no network handshake for arbitrary external gameplay
+	// data. Falling back to the executable's native effects prevents peers
+	// with different local files from silently desynchronizing. Network saves
+	// omit the local profile hash until a real profile handshake exists.
+	if (is_online_game ()) {
+		if (! is->trait_multiplayer_disable_logged) {
+			(*p_OutputDebugStringA) ("[C3X] Custom civilization trait profiles are disabled in network multiplayer.\n");
+			is->trait_multiplayer_disable_logged = true;
+		}
+		return false;
+	}
+	return true;
+}
+
+void
+reset_trait_profiles_to_vanilla (void)
+{
+	memset (is->trait_profiles, 0, sizeof is->trait_profiles);
+	for (int i = 0; i < COUNT_CIV_TRAITS; i++) {
+		struct trait_profile * profile = &is->trait_profiles[i];
+		profile->building_cost_percent = 100;
+		profile->promotion_chance_percent = 100;
+		profile->anarchy_fixed_turns = TRAIT_NO_FIXED_ANARCHY;
+		profile->anarchy_length_percent = 100;
+		profile->worker_rate_percent = 100;
+		profile->sea_sinking_chance_per_mille = TRAIT_NO_SINK_CHANCE_OVERRIDE;
+		profile->ocean_sinking_chance_per_mille = TRAIT_NO_SINK_CHANCE_OVERRIDE;
+		profile->coastal_city_min_water_tiles = 21;
+		profile->coastal_start_min_water_tiles = 21;
+	}
+
+	struct trait_profile * militaristic = &is->trait_profiles[RB_Militaristic];
+	militaristic->building_discount_characteristics = ITC_Militaristic;
+	militaristic->building_cost_percent = 50;
+	militaristic->promotion_chance_percent = 200;
+
+	struct trait_profile * commercial = &is->trait_profiles[RB_Commercial];
+	commercial->optimal_city_number_bonus_percent = 25;
+	commercial->city_center_commerce_bonus[TCS_CITY] = 2;
+	commercial->city_center_commerce_bonus[TCS_METROPOLIS] = 3;
+
+	struct trait_profile * expansionist = &is->trait_profiles[RB_Expansionist];
+	expansionist->starting_scout_count = 1;
+	expansionist->goody_hut_table_bonus = 1;
+	expansionist->goody_huts_never_barbarians = true;
+	expansionist->goody_huts_allow_free_city = true;
+
+	struct trait_profile * scientific = &is->trait_profiles[RB_Scientific];
+	scientific->building_discount_characteristics = ITC_Scientific;
+	scientific->building_cost_percent = 50;
+	scientific->free_era_tech_count = 1;
+	scientific->scientific_great_leader_chance_bonus_per_mille = 20;
+
+	struct trait_profile * religious = &is->trait_profiles[RB_Religious];
+	religious->building_discount_characteristics = ITC_Religious;
+	religious->building_cost_percent = 50;
+	religious->anarchy_fixed_turns = 2;
+
+	struct trait_profile * industrious = &is->trait_profiles[RB_Industrious];
+	industrious->worker_rate_percent = 150;
+	industrious->city_center_shield_bonus[TCS_METROPOLIS] = 1;
+
+	struct trait_profile * agricultural = &is->trait_profiles[RB_Agricultural];
+	agricultural->building_discount_characteristics = ITC_Agricultural;
+	agricultural->building_cost_percent = 50;
+	agricultural->city_center_food_bonus[TCS_TOWN] = 1;
+	agricultural->city_center_food_bonus[TCS_CITY] = 1;
+	agricultural->city_center_food_bonus[TCS_METROPOLIS] = 1;
+	agricultural->irrigated_desert_food_bonus = 1;
+	agricultural->despotism_fresh_water_food_penalty_exception = true;
+
+	struct trait_profile * seafaring = &is->trait_profiles[RB_Seafaring];
+	seafaring->building_discount_characteristics = ITC_Seafaring;
+	seafaring->building_cost_percent = 50;
+	seafaring->sea_unit_move_bonus = 1;
+	seafaring->sea_sinking_chance_per_mille = 250;
+	seafaring->ocean_sinking_chance_per_mille = 250;
+	seafaring->coastal_city_center_commerce_bonus = 1;
+	seafaring->prefer_coastal_start = true;
+
+	memset (is->trait_profile_config_paths, 0, sizeof is->trait_profile_config_paths);
+	is->trait_profile_config_count = 0;
+	is->trait_coastal_start_assignment_done = false;
+	is->trait_custom_coastal_start_runtime_enabled = false;
+	refresh_trait_profile_metadata ();
+}
+
+static int
+trait_player_setup_record_stride (void)
+{
+	return (exe_version_index == 1) ? 0x644 : 0x63C;
+}
+
+static int *
+get_trait_player_setup_record (int slot)
+{
+	if ((p_player_setup_records == NULL) || (slot < 0) || (slot >= 32))
+		return NULL;
+	return (int *)(p_player_setup_records + slot * trait_player_setup_record_stride ());
+}
+
+// Returns whether the two coastal-start fields have any behavioral difference
+// from the stock game. A threshold on a profile which does not request a
+// coastal start is inert and therefore does not activate the custom path.
+static bool
+trait_coastal_start_config_differs_from_vanilla (void)
+{
+	for (int trait_id = 0; trait_id < COUNT_CIV_TRAITS; trait_id++) {
+		struct trait_profile const * profile = &is->trait_profiles[trait_id];
+		bool native_preference = trait_id == RB_Seafaring;
+		if (profile->prefer_coastal_start != native_preference)
+			return true;
+		if (profile->prefer_coastal_start &&
+		    (profile->coastal_start_min_water_tiles != 21))
+			return true;
+	}
+	return false;
+}
+
+// Multiple possessed profiles may independently grant the preference. The
+// least restrictive of those effects wins: satisfying any one of them is
+// enough to make a location eligible.
+static bool
+get_coastal_start_preference_for_race (Race const * race, int * out_min_water_tiles)
+{
+	unsigned int identity = get_trait_identity_mask_for_race (race);
+	int threshold = INT_MAX;
+	for (int trait_id = 0; trait_id < COUNT_CIV_TRAITS; trait_id++) {
+		if ((identity & (1u << trait_id)) == 0)
+			continue;
+		struct trait_profile const * profile = &is->trait_profiles[trait_id];
+		if (profile->prefer_coastal_start &&
+		    (profile->coastal_start_min_water_tiles < threshold))
+			threshold = profile->coastal_start_min_water_tiles;
+	}
+	if (threshold == INT_MAX)
+		return false;
+	if (out_min_water_tiles != NULL)
+		*out_min_water_tiles = not_below (0, threshold);
+	return true;
+}
+
+static int
+count_configured_coastal_start_civs (void)
+{
+	int count = 0;
+	for (int slot = 0; slot < 32; slot++) {
+		int * record = get_trait_player_setup_record (slot);
+		if (record == NULL)
+			continue;
+		int race_id = record[0], slot_type = record[2];
+		// The stock pre-map count excludes unused/closed setup slots (types 0
+		// and 1), the barbarian race, random placeholders, and invalid races.
+		if ((slot_type == 0) || (slot_type == 1) ||
+		    (race_id <= 0) || (race_id >= p_bic_data->RacesCount))
+			continue;
+		if (get_coastal_start_preference_for_race (&p_bic_data->Races[race_id], NULL))
+			count++;
+	}
+	return count;
+}
+
+static int
+get_start_location_adjacent_water_size (Map * map, int tile_index)
+{
+	if ((map == NULL) || (tile_index < 0) || (tile_index >= map->TileCount) ||
+	    (map->Continents == NULL))
+		return -1;
+	int tile_x, tile_y;
+	tile_index_to_coords (map, tile_index, &tile_x, &tile_y);
+	int sea_id = Map_get_largest_adjacent_sea_for_start (map, __, tile_x, tile_y);
+	if ((sea_id < 0) || (sea_id >= map->Continent_Count))
+		return -1;
+	return map->Continents[sea_id].Body.TileCount;
+}
+
+// The executable's five native Seafaring swap paths all share one fixed
+// >20-water-tile bitmap, so they cannot express a different threshold for each
+// race. When coastal profiles are customized those paths are suppressed and
+// this routine performs one complete permutation immediately before the first
+// starting leader (and therefore its units) is initialized.
+static void
+apply_custom_coastal_start_assignment_once (Leader const * leader, int race_id)
+{
+	if (is->trait_coastal_start_assignment_done ||
+	    (! is->trait_custom_coastal_start_runtime_enabled) ||
+	    (! trait_coastal_start_config_differs_from_vanilla ()) ||
+	    (! trait_profile_effects_are_active ()))
+		return;
+
+	Map * map = &p_bic_data->Map;
+	if ((leader == NULL) || (leader->ID <= 0) || (leader->ID >= 32) ||
+	    (race_id <= 0) || (race_id >= p_bic_data->RacesCount) ||
+	    (p_player_setup_records == NULL) ||
+	    (Map_get_largest_adjacent_sea_for_start == NULL))
+		return;
+
+	// initialize_leaders first calls this method for all 32 Leader objects with
+	// race_id == -1, then initializes the barbarians. Do not consume the one-shot
+	// gate until the first real civilization slot is about to be initialized.
+	int trigger_slot = leader->ID;
+	int trigger_location = map->Starting_Locations[trigger_slot];
+	int * trigger_record = get_trait_player_setup_record (trigger_slot);
+	if ((trigger_location < 0) || (trigger_location >= map->TileCount) ||
+	    (trigger_record == NULL) || (trigger_record[0] != race_id))
+		return;
+	is->trait_coastal_start_assignment_done = true;
+
+	int active_slots[32], original_locations[32], water_sizes[32];
+	int thresholds[32], preferred_order[32];
+	int assigned_locations[32];
+	bool source_used[32];
+	int active_count = 0, preferred_count = 0;
+	for (int slot = 0; slot < 32; slot++)
+		assigned_locations[slot] = -1;
+
+	for (int slot = 0; slot < 32; slot++) {
+		int * record = get_trait_player_setup_record (slot);
+		if (record == NULL)
+			continue;
+		int race_id = record[0], slot_type = record[2];
+		int location = map->Starting_Locations[slot];
+		// These are the three live player kinds accepted by the native swap
+		// paths. Invalid and unassigned slots must retain their array entries.
+		if ((slot_type < 2) || (slot_type > 4) ||
+		    (race_id <= 0) || (race_id >= p_bic_data->RacesCount) ||
+		    (location < 0) || (location >= map->TileCount))
+			continue;
+
+		int source = active_count++;
+		active_slots[source] = slot;
+		original_locations[source] = location;
+		water_sizes[source] = get_start_location_adjacent_water_size (map, location);
+		source_used[source] = false;
+
+		int threshold;
+		if (get_coastal_start_preference_for_race (&p_bic_data->Races[race_id], &threshold)) {
+			thresholds[slot] = threshold;
+			preferred_order[preferred_count++] = slot;
+		}
+	}
+
+	// Strictest races go first. Equal thresholds use slot order so the result
+	// is deterministic across all three executables and multiplayer replays.
+	for (int i = 1; i < preferred_count; i++) {
+		int slot = preferred_order[i], j = i;
+		while (j > 0) {
+			int previous = preferred_order[j - 1];
+			if ((thresholds[previous] > thresholds[slot]) ||
+			    ((thresholds[previous] == thresholds[slot]) && (previous < slot)))
+				break;
+			preferred_order[j] = previous;
+			j--;
+		}
+		preferred_order[j] = slot;
+	}
+
+	for (int i = 0; i < preferred_count; i++) {
+		int slot = preferred_order[i], threshold = thresholds[slot];
+		int own_source = -1;
+		for (int source = 0; source < active_count; source++)
+			if (active_slots[source] == slot) {
+				own_source = source;
+				break;
+			}
+
+		int chosen = -1;
+		if ((own_source >= 0) && (! source_used[own_source]) &&
+		    (water_sizes[own_source] >= threshold))
+			chosen = own_source;
+		else {
+			for (int source = 0; source < active_count; source++) {
+				if (source_used[source] || (water_sizes[source] < threshold))
+					continue;
+				if ((chosen < 0) ||
+				    (water_sizes[source] < water_sizes[chosen]) ||
+				    ((water_sizes[source] == water_sizes[chosen]) &&
+				     (active_slots[source] < active_slots[chosen])))
+					chosen = source;
+			}
+		}
+		if (chosen >= 0) {
+			assigned_locations[slot] = original_locations[chosen];
+			source_used[chosen] = true;
+		}
+	}
+
+	// Preserve every still-available civilization's own location first.
+	for (int destination = 0; destination < active_count; destination++) {
+		int slot = active_slots[destination];
+		if ((assigned_locations[slot] < 0) && (! source_used[destination])) {
+			assigned_locations[slot] = original_locations[destination];
+			source_used[destination] = true;
+		}
+	}
+
+	// Fill the remaining holes with the remaining sources in source-slot order.
+	int next_source = 0;
+	for (int destination = 0; destination < active_count; destination++) {
+		int slot = active_slots[destination];
+		if (assigned_locations[slot] >= 0)
+			continue;
+		while ((next_source < active_count) && source_used[next_source])
+			next_source++;
+		if (next_source >= active_count)
+			return; // Defensive: do not publish a partial permutation.
+		assigned_locations[slot] = original_locations[next_source];
+		source_used[next_source++] = true;
+	}
+
+	for (int destination = 0; destination < active_count; destination++) {
+		int slot = active_slots[destination];
+		map->Starting_Locations[slot] = assigned_locations[slot];
+	}
+}
+
+enum trait_profile_field_bit {
+	TPFB_BUILDING_DISCOUNT_TAGS       = 1u << 0,
+	TPFB_BUILDING_COST_PERCENT        = 1u << 1,
+	TPFB_PROMOTION_CHANCE_PERCENT     = 1u << 2,
+	TPFB_OCN_BONUS_PERCENT            = 1u << 3,
+	TPFB_CENTER_FOOD                  = 1u << 4,
+	TPFB_CENTER_SHIELDS               = 1u << 5,
+	TPFB_CENTER_COMMERCE              = 1u << 6,
+	TPFB_STARTING_SCOUT_COUNT         = 1u << 7,
+	TPFB_HUT_TABLE_BONUS              = 1u << 8,
+	TPFB_HUTS_NEVER_BARBARIANS        = 1u << 9,
+	TPFB_HUTS_ALLOW_FREE_CITY         = 1u << 10,
+	TPFB_FREE_ERA_TECH_COUNT          = 1u << 11,
+	TPFB_SGL_CHANCE_BONUS             = 1u << 12,
+	TPFB_ANARCHY_FIXED_TURNS          = 1u << 13,
+	TPFB_ANARCHY_LENGTH_PERCENT       = 1u << 14,
+	TPFB_WORKER_RATE_PERCENT          = 1u << 15,
+	TPFB_IRRIGATED_DESERT_FOOD        = 1u << 16,
+	TPFB_DESPOTISM_FRESH_WATER        = 1u << 17,
+	TPFB_SEA_MOVE_BONUS               = 1u << 18,
+	TPFB_SEA_SINK_CHANCE              = 1u << 19,
+	TPFB_OCEAN_SINK_CHANCE            = 1u << 20,
+	TPFB_COASTAL_CENTER_COMMERCE      = 1u << 21,
+	TPFB_COASTAL_CITY_MIN_WATER       = 1u << 22,
+	TPFB_PREFER_COASTAL_START         = 1u << 23,
+	TPFB_COASTAL_START_MIN_WATER      = 1u << 24
+};
+
+struct parsed_trait_profile_override {
+	struct trait_profile values;
+	unsigned int fields;
+	int trait_id;
+	int section_start_line;
+	bool has_name;
+};
+
+char
+trait_ascii_lower (char c)
+{
+	if ((c >= 'A') && (c <= 'Z'))
+		return c + ('a' - 'A');
+	return c;
+}
+
+bool
+trait_slice_matches_token (struct string_slice const * slice, char const * token)
+{
+	if ((slice == NULL) || (token == NULL))
+		return false;
+	struct string_slice trimmed = trim_string_slice (slice, 1);
+	int token_len = strlen (token);
+	if (trimmed.len != token_len)
+		return false;
+	for (int i = 0; i < token_len; i++)
+		if (trait_ascii_lower (trimmed.str[i]) != trait_ascii_lower (token[i]))
+			return false;
+	return true;
+}
+
+bool
+find_stable_trait_id (struct string_slice const * token, int * out_id)
+{
+	char const * const names[COUNT_CIV_TRAITS] = {
+		"Militaristic", "Commercial", "Expansionist", "Scientific",
+		"Religious", "Industrious", "Agricultural", "Seafaring"
+	};
+	for (int i = 0; i < COUNT_CIV_TRAITS; i++) {
+		if (trait_slice_matches_token (token, names[i])) {
+			*out_id = i;
+			return true;
+		}
+	}
+	return false;
+}
+
+unsigned int
+trait_id_to_improvement_characteristic (int trait_id)
+{
+	switch (trait_id) {
+		case RB_Militaristic: return ITC_Militaristic;
+		case RB_Commercial:   return ITC_Commercial;
+		case RB_Expansionist: return ITC_Expansionistic;
+		case RB_Scientific:   return ITC_Scientific;
+		case RB_Religious:    return ITC_Religious;
+		case RB_Industrious:  return ITC_Industrious;
+		case RB_Agricultural: return ITC_Agricultural;
+		case RB_Seafaring:    return ITC_Seafaring;
+		default:              return 0;
+	}
+}
+
+void
+init_parsed_trait_profile_override (struct parsed_trait_profile_override * parsed, int section_start_line)
+{
+	memset (parsed, 0, sizeof *parsed);
+	parsed->trait_id = -1;
+	parsed->section_start_line = section_start_line;
+}
+
+bool
+begin_trait_profile_field (struct parsed_trait_profile_override * parsed,
+			   unsigned int field,
+			   struct string_slice const * key,
+			   int line_number,
+			   struct error_line ** parse_errors)
+{
+	if ((parsed->fields & field) != 0) {
+		add_key_parse_error (parse_errors, line_number, key, NULL,
+				     "(specified more than once in this #Trait block)");
+		return false;
+	}
+	parsed->fields |= field;
+	return true;
+}
+
+bool
+read_trait_int_in_range (struct string_slice const * value,
+			 int min_value,
+			 int max_value,
+			 int * out,
+			 struct string_slice const * key,
+			 int line_number,
+			 struct error_line ** parse_errors)
+{
+	int parsed;
+	if (read_int (value, &parsed) && (parsed >= min_value) && (parsed <= max_value)) {
+		*out = parsed;
+		return true;
+	}
+
+	char suffix[100];
+	snprintf (suffix, sizeof suffix, "(expected integer from %d to %d)", min_value, max_value);
+	suffix[(sizeof suffix) - 1] = '\0';
+	add_key_parse_error (parse_errors, line_number, key, value, suffix);
+	return false;
+}
+
+bool
+read_trait_boolean (struct string_slice const * value,
+		    bool * out,
+		    struct string_slice const * key,
+		    int line_number,
+		    struct error_line ** parse_errors)
+{
+	int parsed;
+	if (read_int (value, &parsed) && ((parsed == 0) || (parsed == 1))) {
+		*out = parsed != 0;
+		return true;
+	}
+	add_key_parse_error (parse_errors, line_number, key, value, "(expected 0, 1, false, or true)");
+	return false;
+}
+
+bool
+read_trait_city_size_values (struct string_slice const * value,
+			     int out[COUNT_TRAIT_CITY_SIZES],
+			     struct string_slice const * key,
+			     int line_number,
+			     struct error_line ** parse_errors)
+{
+	char * text = extract_slice (value);
+	char * cursor = text;
+	int values[COUNT_TRAIT_CITY_SIZES];
+	bool ok = parse_int (&cursor, &values[TCS_TOWN]) &&
+		  skip_punctuation (&cursor, ',') &&
+		  parse_int (&cursor, &values[TCS_CITY]) &&
+		  skip_punctuation (&cursor, ',') &&
+		  parse_int (&cursor, &values[TCS_METROPOLIS]);
+	skip_horiz_space (&cursor);
+	ok = ok && (*cursor == '\0');
+	for (int i = 0; ok && (i < COUNT_TRAIT_CITY_SIZES); i++)
+		ok = (values[i] >= -1000) && (values[i] <= 1000);
+
+	if (ok)
+		memcpy (out, values, sizeof values);
+	else
+		add_key_parse_error (parse_errors, line_number, key, value,
+				     "(expected three comma-separated integers from -1000 to 1000: town, city, metropolis)");
+	free (text);
+	return ok;
+}
+
+bool
+read_trait_discount_tags (struct string_slice const * value,
+			  unsigned int * out_mask,
+			  struct string_slice const * key,
+			  int line_number,
+			  struct error_line ** parse_errors)
+{
+	struct string_slice remaining = trim_string_slice (value, 0);
+	if ((remaining.len == 0) || trait_slice_matches_token (&remaining, "None")) {
+		*out_mask = 0;
+		return true;
+	}
+
+	unsigned int mask = 0;
+	while (remaining.len > 0) {
+		int comma_index = -1;
+		for (int i = 0; i < remaining.len; i++) {
+			if (remaining.str[i] == ',') {
+				comma_index = i;
+				break;
+			}
+		}
+
+		struct string_slice item = remaining;
+		if (comma_index >= 0)
+			item.len = comma_index;
+		item = trim_string_slice (&item, 1);
+
+		int trait_id = -1;
+		if ((item.len == 0) || (! find_stable_trait_id (&item, &trait_id))) {
+			struct error_line * err = add_error_line (parse_errors);
+			snprintf (err->text, sizeof err->text,
+				  "^  Line %d: %.*s entry \"%.*s\" is not a stable trait token",
+				  line_number, key->len, key->str, item.len, item.str);
+			err->text[(sizeof err->text) - 1] = '\0';
+			return false;
+		}
+		mask |= trait_id_to_improvement_characteristic (trait_id);
+
+		if (comma_index < 0)
+			break;
+		remaining.str += comma_index + 1;
+		remaining.len -= comma_index + 1;
+		remaining = trim_string_slice (&remaining, 0);
+	}
+
+	*out_mask = mask;
+	return true;
+}
+
+void
+handle_trait_profile_key (struct parsed_trait_profile_override * parsed,
+			  struct string_slice const * key,
+			  struct string_slice const * value,
+			  int line_number,
+			  struct error_line ** parse_errors,
+			  struct error_line ** unrecognized_keys)
+{
+	struct trait_profile * values = &parsed->values;
+	unsigned int field = 0;
+
+	if (slice_matches_str (key, "name")) {
+		if (parsed->has_name) {
+			add_key_parse_error (parse_errors, line_number, key, NULL,
+					     "(specified more than once in this #Trait block)");
+			return;
+		}
+		parsed->has_name = true;
+		if (! find_stable_trait_id (value, &parsed->trait_id)) {
+			parsed->trait_id = -1;
+			add_key_parse_error (parse_errors, line_number, key, value,
+					     "(expected one of the eight stable English trait tokens)");
+		}
+		return;
+	}
+
+#define BEGIN_TRAIT_FIELD(bit) do { field = (bit); if (! begin_trait_profile_field (parsed, field, key, line_number, parse_errors)) return; } while (0)
+
+	if (slice_matches_str (key, "building_discount_tags")) {
+		BEGIN_TRAIT_FIELD (TPFB_BUILDING_DISCOUNT_TAGS);
+		read_trait_discount_tags (value, &values->building_discount_characteristics, key, line_number, parse_errors);
+	} else if (slice_matches_str (key, "building_cost_percent")) {
+		BEGIN_TRAIT_FIELD (TPFB_BUILDING_COST_PERCENT);
+		read_trait_int_in_range (value, 0, 10000, &values->building_cost_percent, key, line_number, parse_errors);
+	} else if (slice_matches_str (key, "promotion_chance_percent")) {
+		BEGIN_TRAIT_FIELD (TPFB_PROMOTION_CHANCE_PERCENT);
+		read_trait_int_in_range (value, 0, 10000, &values->promotion_chance_percent, key, line_number, parse_errors);
+	} else if (slice_matches_str (key, "optimal_city_number_bonus_percent")) {
+		BEGIN_TRAIT_FIELD (TPFB_OCN_BONUS_PERCENT);
+		read_trait_int_in_range (value, -100, 10000, &values->optimal_city_number_bonus_percent, key, line_number, parse_errors);
+	} else if (slice_matches_str (key, "city_center_food_bonus")) {
+		BEGIN_TRAIT_FIELD (TPFB_CENTER_FOOD);
+		read_trait_city_size_values (value, values->city_center_food_bonus, key, line_number, parse_errors);
+	} else if (slice_matches_str (key, "city_center_shield_bonus")) {
+		BEGIN_TRAIT_FIELD (TPFB_CENTER_SHIELDS);
+		read_trait_city_size_values (value, values->city_center_shield_bonus, key, line_number, parse_errors);
+	} else if (slice_matches_str (key, "city_center_commerce_bonus")) {
+		BEGIN_TRAIT_FIELD (TPFB_CENTER_COMMERCE);
+		read_trait_city_size_values (value, values->city_center_commerce_bonus, key, line_number, parse_errors);
+	} else if (slice_matches_str (key, "starting_scout_count")) {
+		BEGIN_TRAIT_FIELD (TPFB_STARTING_SCOUT_COUNT);
+		read_trait_int_in_range (value, 0, 100, &values->starting_scout_count, key, line_number, parse_errors);
+	} else if (slice_matches_str (key, "goody_hut_table_bonus")) {
+		BEGIN_TRAIT_FIELD (TPFB_HUT_TABLE_BONUS);
+		read_trait_int_in_range (value, -20, 20, &values->goody_hut_table_bonus, key, line_number, parse_errors);
+	} else if (slice_matches_str (key, "goody_huts_never_barbarians")) {
+		BEGIN_TRAIT_FIELD (TPFB_HUTS_NEVER_BARBARIANS);
+		read_trait_boolean (value, &values->goody_huts_never_barbarians, key, line_number, parse_errors);
+	} else if (slice_matches_str (key, "goody_huts_allow_free_city")) {
+		BEGIN_TRAIT_FIELD (TPFB_HUTS_ALLOW_FREE_CITY);
+		read_trait_boolean (value, &values->goody_huts_allow_free_city, key, line_number, parse_errors);
+	} else if (slice_matches_str (key, "free_era_tech_count")) {
+		BEGIN_TRAIT_FIELD (TPFB_FREE_ERA_TECH_COUNT);
+		read_trait_int_in_range (value, 0, 100, &values->free_era_tech_count, key, line_number, parse_errors);
+	} else if (slice_matches_str (key, "scientific_great_leader_chance_bonus_per_mille")) {
+		BEGIN_TRAIT_FIELD (TPFB_SGL_CHANCE_BONUS);
+		read_trait_int_in_range (value, -1000, 1000, &values->scientific_great_leader_chance_bonus_per_mille, key, line_number, parse_errors);
+	} else if (slice_matches_str (key, "anarchy_fixed_turns")) {
+		BEGIN_TRAIT_FIELD (TPFB_ANARCHY_FIXED_TURNS);
+		read_trait_int_in_range (value, TRAIT_NO_FIXED_ANARCHY, 1000, &values->anarchy_fixed_turns, key, line_number, parse_errors);
+	} else if (slice_matches_str (key, "anarchy_length_percent")) {
+		BEGIN_TRAIT_FIELD (TPFB_ANARCHY_LENGTH_PERCENT);
+		read_trait_int_in_range (value, 0, 10000, &values->anarchy_length_percent, key, line_number, parse_errors);
+	} else if (slice_matches_str (key, "worker_rate_percent")) {
+		BEGIN_TRAIT_FIELD (TPFB_WORKER_RATE_PERCENT);
+		read_trait_int_in_range (value, 0, 10000, &values->worker_rate_percent, key, line_number, parse_errors);
+	} else if (slice_matches_str (key, "irrigated_desert_food_bonus")) {
+		BEGIN_TRAIT_FIELD (TPFB_IRRIGATED_DESERT_FOOD);
+		read_trait_int_in_range (value, -100, 100, &values->irrigated_desert_food_bonus, key, line_number, parse_errors);
+	} else if (slice_matches_str (key, "despotism_fresh_water_food_penalty_exception")) {
+		BEGIN_TRAIT_FIELD (TPFB_DESPOTISM_FRESH_WATER);
+		read_trait_boolean (value, &values->despotism_fresh_water_food_penalty_exception, key, line_number, parse_errors);
+	} else if (slice_matches_str (key, "sea_unit_move_bonus")) {
+		BEGIN_TRAIT_FIELD (TPFB_SEA_MOVE_BONUS);
+		read_trait_int_in_range (value, -100, 100, &values->sea_unit_move_bonus, key, line_number, parse_errors);
+	} else if (slice_matches_str (key, "sea_sinking_chance_per_mille")) {
+		BEGIN_TRAIT_FIELD (TPFB_SEA_SINK_CHANCE);
+		read_trait_int_in_range (value, TRAIT_NO_SINK_CHANCE_OVERRIDE, 1000, &values->sea_sinking_chance_per_mille, key, line_number, parse_errors);
+	} else if (slice_matches_str (key, "ocean_sinking_chance_per_mille")) {
+		BEGIN_TRAIT_FIELD (TPFB_OCEAN_SINK_CHANCE);
+		read_trait_int_in_range (value, TRAIT_NO_SINK_CHANCE_OVERRIDE, 1000, &values->ocean_sinking_chance_per_mille, key, line_number, parse_errors);
+	} else if (slice_matches_str (key, "coastal_city_center_commerce_bonus")) {
+		BEGIN_TRAIT_FIELD (TPFB_COASTAL_CENTER_COMMERCE);
+		read_trait_int_in_range (value, -100, 100, &values->coastal_city_center_commerce_bonus, key, line_number, parse_errors);
+	} else if (slice_matches_str (key, "coastal_city_min_water_tiles")) {
+		BEGIN_TRAIT_FIELD (TPFB_COASTAL_CITY_MIN_WATER);
+		read_trait_int_in_range (value, 0, 1000000, &values->coastal_city_min_water_tiles, key, line_number, parse_errors);
+	} else if (slice_matches_str (key, "prefer_coastal_start")) {
+		BEGIN_TRAIT_FIELD (TPFB_PREFER_COASTAL_START);
+		read_trait_boolean (value, &values->prefer_coastal_start, key, line_number, parse_errors);
+	} else if (slice_matches_str (key, "coastal_start_min_water_tiles")) {
+		BEGIN_TRAIT_FIELD (TPFB_COASTAL_START_MIN_WATER);
+		read_trait_int_in_range (value, 0, 1000000, &values->coastal_start_min_water_tiles, key, line_number, parse_errors);
+	} else {
+		add_unrecognized_key_error (unrecognized_keys, line_number, key);
+	}
+
+#undef BEGIN_TRAIT_FIELD
+}
+
+void
+apply_parsed_trait_profile_override (struct trait_profile profiles[COUNT_CIV_TRAITS],
+				     struct parsed_trait_profile_override const * parsed,
+				     struct error_line ** parse_errors)
+{
+	if ((! parsed->has_name) || (parsed->trait_id < 0) || (parsed->trait_id >= COUNT_CIV_TRAITS)) {
+		if (! parsed->has_name) {
+			struct error_line * err = add_error_line (parse_errors);
+			snprintf (err->text, sizeof err->text, "^  Line %d: name (stable English trait token is required)", parsed->section_start_line);
+			err->text[(sizeof err->text) - 1] = '\0';
+		}
+		return;
+	}
+
+	struct trait_profile * dest = &profiles[parsed->trait_id];
+	struct trait_profile const * src = &parsed->values;
+#define APPLY_TRAIT_FIELD(bit, member) do { if ((parsed->fields & (bit)) != 0) dest->member = src->member; } while (0)
+	APPLY_TRAIT_FIELD (TPFB_BUILDING_DISCOUNT_TAGS, building_discount_characteristics);
+	APPLY_TRAIT_FIELD (TPFB_BUILDING_COST_PERCENT, building_cost_percent);
+	APPLY_TRAIT_FIELD (TPFB_PROMOTION_CHANCE_PERCENT, promotion_chance_percent);
+	APPLY_TRAIT_FIELD (TPFB_OCN_BONUS_PERCENT, optimal_city_number_bonus_percent);
+	if ((parsed->fields & TPFB_CENTER_FOOD) != 0)
+		memcpy (dest->city_center_food_bonus, src->city_center_food_bonus, sizeof dest->city_center_food_bonus);
+	if ((parsed->fields & TPFB_CENTER_SHIELDS) != 0)
+		memcpy (dest->city_center_shield_bonus, src->city_center_shield_bonus, sizeof dest->city_center_shield_bonus);
+	if ((parsed->fields & TPFB_CENTER_COMMERCE) != 0)
+		memcpy (dest->city_center_commerce_bonus, src->city_center_commerce_bonus, sizeof dest->city_center_commerce_bonus);
+	APPLY_TRAIT_FIELD (TPFB_STARTING_SCOUT_COUNT, starting_scout_count);
+	APPLY_TRAIT_FIELD (TPFB_HUT_TABLE_BONUS, goody_hut_table_bonus);
+	APPLY_TRAIT_FIELD (TPFB_HUTS_NEVER_BARBARIANS, goody_huts_never_barbarians);
+	APPLY_TRAIT_FIELD (TPFB_HUTS_ALLOW_FREE_CITY, goody_huts_allow_free_city);
+	APPLY_TRAIT_FIELD (TPFB_FREE_ERA_TECH_COUNT, free_era_tech_count);
+	APPLY_TRAIT_FIELD (TPFB_SGL_CHANCE_BONUS, scientific_great_leader_chance_bonus_per_mille);
+	APPLY_TRAIT_FIELD (TPFB_ANARCHY_FIXED_TURNS, anarchy_fixed_turns);
+	APPLY_TRAIT_FIELD (TPFB_ANARCHY_LENGTH_PERCENT, anarchy_length_percent);
+	APPLY_TRAIT_FIELD (TPFB_WORKER_RATE_PERCENT, worker_rate_percent);
+	APPLY_TRAIT_FIELD (TPFB_IRRIGATED_DESERT_FOOD, irrigated_desert_food_bonus);
+	APPLY_TRAIT_FIELD (TPFB_DESPOTISM_FRESH_WATER, despotism_fresh_water_food_penalty_exception);
+	APPLY_TRAIT_FIELD (TPFB_SEA_MOVE_BONUS, sea_unit_move_bonus);
+	APPLY_TRAIT_FIELD (TPFB_SEA_SINK_CHANCE, sea_sinking_chance_per_mille);
+	APPLY_TRAIT_FIELD (TPFB_OCEAN_SINK_CHANCE, ocean_sinking_chance_per_mille);
+	APPLY_TRAIT_FIELD (TPFB_COASTAL_CENTER_COMMERCE, coastal_city_center_commerce_bonus);
+	APPLY_TRAIT_FIELD (TPFB_COASTAL_CITY_MIN_WATER, coastal_city_min_water_tiles);
+	APPLY_TRAIT_FIELD (TPFB_PREFER_COASTAL_START, prefer_coastal_start);
+	APPLY_TRAIT_FIELD (TPFB_COASTAL_START_MIN_WATER, coastal_start_min_water_tiles);
+#undef APPLY_TRAIT_FIELD
+}
+
+void
+record_applied_trait_profile_config (char const * path)
+{
+	if (is->trait_profile_config_count < ARRAY_LEN (is->trait_profile_config_paths)) {
+		strncpy (is->trait_profile_config_paths[is->trait_profile_config_count], path, MAX_PATH);
+		is->trait_profile_config_paths[is->trait_profile_config_count][MAX_PATH - 1] = '\0';
+		is->trait_profile_config_count += 1;
+	}
+
+	struct loaded_config_name * new_name = malloc (sizeof *new_name);
+	if (new_name == NULL)
+		return;
+	new_name->name = strdup (path);
+	new_name->next = NULL;
+	if (new_name->name == NULL) {
+		free (new_name);
+		return;
+	}
+
+	if (is->loaded_config_names == NULL) {
+		is->loaded_config_names = new_name;
+		return;
+	}
+	struct loaded_config_name * last = is->loaded_config_names;
+	while (last->next != NULL)
+		last = last->next;
+	last->next = new_name;
+}
+
+void
+report_trait_profile_config_errors (char const * path,
+				    struct error_line * parse_errors,
+				    struct error_line * unrecognized_keys)
+{
+	char debug_message[300];
+	snprintf (debug_message, sizeof debug_message,
+		  "[C3X] Civilization trait config rejected; no values from this file were applied: %s\n", path);
+	debug_message[(sizeof debug_message) - 1] = '\0';
+	(*p_OutputDebugStringA) (debug_message);
+	// Custom profiles have no gameplay effect in network multiplayer. Avoid a
+	// modal error that could pause only one peer; the debugger message above is
+	// still retained for diagnosing that peer's local installation.
+	if (is_online_game ())
+		return;
+
+	PopupForm * popup = get_popup_form ();
+	popup->vtable->set_text_key_and_flags (popup, __, is->mod_script_path, "C3X_WARNING", -1, 0, 0, 0);
+	char header[200];
+	snprintf (header, sizeof header, "Civilization Trait Config errors in %s:", path);
+	header[(sizeof header) - 1] = '\0';
+	PopupForm_add_text (popup, __, header, false);
+	PopupForm_add_text (popup, __, "This file was rejected; none of its values were applied.", false);
+	if (parse_errors != NULL) {
+		for (struct error_line * line = parse_errors; line != NULL; line = line->next)
+			PopupForm_add_text (popup, __, line->text, false);
+	}
+	if (unrecognized_keys != NULL) {
+		PopupForm_add_text (popup, __, "", false);
+		PopupForm_add_text (popup, __, "Unrecognized keys:", false);
+		for (struct error_line * line = unrecognized_keys; line != NULL; line = line->next)
+			PopupForm_add_text (popup, __, line->text, false);
+	}
+	patch_show_popup (popup, __, 0, 0);
+}
+
+bool
+load_trait_profile_config_file (char const * file_path, int path_is_relative_to_mod_dir, int log_missing)
+{
+	char path[MAX_PATH];
+	if (path_is_relative_to_mod_dir)
+		snprintf (path, sizeof path, "%s\\%s", is->mod_rel_dir, file_path);
+	else
+		strncpy (path, file_path, sizeof path);
+	path[(sizeof path) - 1] = '\0';
+
+	char * text = file_to_string (path);
+	if (text == NULL) {
+		if (log_missing) {
+			char message[300];
+			snprintf (message, sizeof message, "[C3X] Civilization trait config file not found: %s\n", path);
+			message[(sizeof message) - 1] = '\0';
+			(*p_OutputDebugStringA) (message);
+		}
+		return false;
+	}
+
+	struct trait_profile candidate[COUNT_CIV_TRAITS];
+	memcpy (candidate, is->trait_profiles, sizeof candidate);
+	struct parsed_trait_profile_override parsed;
+	init_parsed_trait_profile_override (&parsed, 0);
+	bool in_section = false;
+	int line_number = 0;
+	struct error_line * parse_errors = NULL;
+	struct error_line * unrecognized_keys = NULL;
+
+	char * cursor = text;
+	while (*cursor != '\0') {
+		line_number += 1;
+		char * line_start = cursor;
+		char * line_end = cursor;
+		while ((*line_end != '\0') && (*line_end != '\n'))
+			line_end++;
+		int line_len = line_end - line_start;
+		bool has_newline = *line_end == '\n';
+		if (has_newline)
+			*line_end = '\0';
+
+		struct string_slice line = { .str = line_start, .len = line_len };
+		struct string_slice trimmed = trim_string_slice (&line, 0);
+		if (line_is_empty_or_comment (&trimmed)) {
+			cursor = has_newline ? line_end + 1 : line_end;
+			continue;
+		}
+
+		if (trimmed.str[0] == '#') {
+			if (in_section)
+				apply_parsed_trait_profile_override (candidate, &parsed, &parse_errors);
+			struct string_slice directive = { .str = trimmed.str + 1, .len = trimmed.len - 1 };
+			directive = trim_string_slice (&directive, 0);
+			if (trait_slice_matches_token (&directive, "Trait")) {
+				in_section = true;
+				init_parsed_trait_profile_override (&parsed, line_number);
+			} else {
+				in_section = false;
+				struct error_line * err = add_error_line (&parse_errors);
+				snprintf (err->text, sizeof err->text, "^  Line %d: unknown directive #%.*s (expected #Trait)", line_number, directive.len, directive.str);
+				err->text[(sizeof err->text) - 1] = '\0';
+			}
+			cursor = has_newline ? line_end + 1 : line_end;
+			continue;
+		}
+
+		if (! in_section) {
+			struct error_line * err = add_error_line (&parse_errors);
+			snprintf (err->text, sizeof err->text, "^  Line %d: content must be inside a #Trait block", line_number);
+			err->text[(sizeof err->text) - 1] = '\0';
+			cursor = has_newline ? line_end + 1 : line_end;
+			continue;
+		}
+
+		struct string_slice key = {0};
+		struct string_slice value = {0};
+		enum key_value_parse_status status = parse_trimmed_key_value (&trimmed, &key, &value);
+		if (status == KVP_NO_EQUALS) {
+			struct error_line * err = add_error_line (&parse_errors);
+			snprintf (err->text, sizeof err->text, "^  Line %d: %.*s (expected '=')", line_number, trimmed.len, trimmed.str);
+			err->text[(sizeof err->text) - 1] = '\0';
+		} else if (status == KVP_EMPTY_KEY) {
+			struct error_line * err = add_error_line (&parse_errors);
+			snprintf (err->text, sizeof err->text, "^  Line %d: (missing key)", line_number);
+			err->text[(sizeof err->text) - 1] = '\0';
+		} else {
+			handle_trait_profile_key (&parsed, &key, &value, line_number, &parse_errors, &unrecognized_keys);
+		}
+		cursor = has_newline ? line_end + 1 : line_end;
+	}
+
+	if (in_section)
+		apply_parsed_trait_profile_override (candidate, &parsed, &parse_errors);
+	free (text);
+
+	bool valid = (parse_errors == NULL) && (unrecognized_keys == NULL);
+	if (valid) {
+		memcpy (is->trait_profiles, candidate, sizeof candidate);
+		record_applied_trait_profile_config (path);
+	} else {
+		report_trait_profile_config_errors (path, parse_errors, unrecognized_keys);
+	}
+	free_error_lines (parse_errors);
+	free_error_lines (unrecognized_keys);
+	return valid;
+}
+
+void
+load_trait_profile_configs (void)
+{
+	// These files layer like the main C3X configs. Each individual file is
+	// transactional: a malformed higher-priority file cannot partially alter
+	// values from a lower-priority file.
+	reset_trait_profiles_to_vanilla ();
+	is->trait_coastal_start_assignment_done = false;
+	is->trait_custom_coastal_start_runtime_enabled = false;
+	load_trait_profile_config_file ("default.civilization_traits_config.txt", 1, 1);
+
+	char * scenario_file_name = "scenario.civilization_traits_config.txt";
+	char * scenario_path = BIC_get_asset_path (p_bic_data, __, scenario_file_name, false);
+	if ((scenario_path != NULL) &&
+	    (0 != strcmp (scenario_file_name, scenario_path)) &&
+	    file_exists_at_path (scenario_path))
+		load_trait_profile_config_file (scenario_path, 0, 0);
+
+	char user_path[MAX_PATH];
+	snprintf (user_path, sizeof user_path, "%s\\%s", is->mod_rel_dir, "user.civilization_traits_config.txt");
+	user_path[(sizeof user_path) - 1] = '\0';
+	if (file_exists_at_path (user_path))
+		load_trait_profile_config_file ("user.civilization_traits_config.txt", 1, 0);
+
+	// Config files are layered transactionally above, so publish compatibility
+	// metadata only after the final accepted layer is in place.
+	refresh_trait_profile_metadata ();
+}
+
 bool
 line_is_empty_or_comment (struct string_slice const * trimmed)
 {
@@ -14254,14 +15609,120 @@ calculate_city_center_district_bonus (City * city, int * out_food, int * out_shi
 		*out_gold = bonus_gold;
 }
 
+struct trait_yield_race_restore {
+	Race * race;
+	int bonuses;
+};
+
+static Race *
+get_trait_yield_race_for_civ (int civ_id)
+{
+	if ((p_bic_data == NULL) || (leaders == NULL) ||
+	    (p_bic_data->Races == NULL) ||
+	    (civ_id < 0) || (civ_id >= 32))
+		return NULL;
+	int race_id = leaders[civ_id].RaceID;
+	if ((race_id < 0) || (race_id >= p_bic_data->RacesCount))
+		return NULL;
+	return &p_bic_data->Races[race_id];
+}
+
+// The stock yield functions normally read the race passed in civ_id, but a
+// few city-centre checks read the owner from the tile instead. Preserve both
+// Race objects (or one if they are the same) while temporarily neutralizing
+// the built-in effects.
+static int
+collect_trait_yield_races (int civ_id, City * tile_city,
+			   struct trait_yield_race_restore restores[2])
+{
+	int count = 0;
+	Race * civ_race = get_trait_yield_race_for_civ (civ_id);
+	if (civ_race != NULL) {
+		restores[count].race = civ_race;
+		restores[count].bonuses = civ_race->Bonuses;
+		count++;
+	}
+
+	if (tile_city != NULL) {
+		Race * owner_race = get_trait_yield_race_for_civ ((unsigned char)tile_city->Body.CivID);
+		if ((owner_race != NULL) && ((count == 0) || (owner_race != restores[0].race))) {
+			restores[count].race = owner_race;
+			restores[count].bonuses = owner_race->Bonuses;
+			count++;
+		}
+	}
+	return count;
+}
+
+static void
+set_trait_yield_race_bits (struct trait_yield_race_restore restores[2], int count,
+			   unsigned int clear_bits, Race * race_to_set,
+			   unsigned int set_bits)
+{
+	for (int i = 0; i < count; i++) {
+		unsigned int bonuses = (unsigned int)restores[i].bonuses & ~clear_bits;
+		if (restores[i].race == race_to_set)
+			bonuses |= set_bits;
+		restores[i].race->Bonuses = (int)bonuses;
+	}
+}
+
+static void
+restore_trait_yield_races (struct trait_yield_race_restore restores[2], int count)
+{
+	for (int i = 0; i < count; i++)
+		restores[i].race->Bonuses = restores[i].bonuses;
+}
+
+static Government *
+get_trait_yield_government_for_civ (int civ_id)
+{
+	if ((p_bic_data == NULL) || (leaders == NULL) ||
+	    (p_bic_data->Governments == NULL) ||
+	    (civ_id < 0) || (civ_id >= 32))
+		return NULL;
+	int government_id = leaders[civ_id].GovernmentType;
+	if ((government_id < 0) || (government_id >= p_bic_data->GovernmentsCount))
+		return NULL;
+	return &p_bic_data->Governments[government_id];
+}
+
+static City *
+get_trait_yield_tile_city (Tile * tile)
+{
+	if ((tile == NULL) || (tile == p_null_tile))
+		return NULL;
+	return get_city_ptr (tile->vtable->m45_Get_City_ID (tile));
+}
+
+static int
+get_trait_yield_city_size (City const * city)
+{
+	if ((city != NULL) &&
+	    (city->Body.Population.Size > p_bic_data->General.MaximumSize_City))
+		return TCS_METROPOLIS;
+	if ((city != NULL) &&
+	    (city->Body.Population.Size > p_bic_data->General.MaximumSize_Town))
+		return TCS_CITY;
+	return TCS_TOWN;
+}
+
+static int
+clamp_trait_yield (long long value)
+{
+	if (value <= 0)
+		return 0;
+	if (value > INT_MAX)
+		return INT_MAX;
+	return (int)value;
+}
+
 int __fastcall
 patch_Map_calc_food_yield_at (Map * this, int edx, int tile_x, int tile_y, int tile_base_type, int civ_id, int imagine_fully_improved, City * city)
 {
-	if (! is->current_config.enable_districts)
-		return Map_calc_food_yield_at (this, __, tile_x, tile_y, tile_base_type, civ_id, imagine_fully_improved, city);
-
 	Tile * tile = tile_at (tile_x, tile_y);
-	if ((tile != NULL) && (tile != p_null_tile)) {
+	if (is->current_config.enable_districts &&
+	    (tile != NULL) && (tile != p_null_tile)) {
 		struct district_instance * inst = get_district_instance (tile);
 		if (inst != NULL &&
 		    district_is_complete (tile, inst->district_id)) {
@@ -14283,17 +15744,109 @@ patch_Map_calc_food_yield_at (Map * this, int edx, int tile_x, int tile_y, int t
 		}
 	}
 
-	return Map_calc_food_yield_at (this, __, tile_x, tile_y, tile_base_type, civ_id, imagine_fully_improved, city);
+	// This also keeps network multiplayer and all-vanilla profiles on the
+	// exact stock path (apart from the already-existing district handling).
+	if ((! trait_profile_effects_are_active ()) ||
+	    (tile == NULL) || (tile == p_null_tile) ||
+	    (tile->vtable->m20_Check_Pollution (tile, __, 0) != 0))
+		return Map_calc_food_yield_at (this, __, tile_x, tile_y, tile_base_type, civ_id, imagine_fully_improved, city);
+
+	City * tile_city = get_trait_yield_tile_city (tile);
+	if (Tile_has_city (tile) && (tile_city == NULL))
+		return Map_calc_food_yield_at (this, __, tile_x, tile_y, tile_base_type, civ_id, imagine_fully_improved, city);
+	Leader * yield_leader = ((civ_id >= 0) && (civ_id < 32)) ? &leaders[civ_id] : NULL;
+	struct trait_profile yield_effects;
+	if ((yield_leader == NULL) ||
+	    ! aggregate_trait_profiles_for_leader (yield_leader, 0, &yield_effects))
+		return Map_calc_food_yield_at (this, __, tile_x, tile_y, tile_base_type, civ_id, imagine_fully_improved, city);
+
+	struct trait_profile centre_effects;
+	if (tile_city != NULL) {
+		int owner_id = (unsigned char)tile_city->Body.CivID;
+		if ((owner_id >= 32) ||
+		    ! aggregate_trait_profiles_for_leader (&leaders[owner_id], 0, &centre_effects))
+			return Map_calc_food_yield_at (this, __, tile_x, tile_y, tile_base_type, civ_id, imagine_fully_improved, city);
+	}
+
+	// A change to an unrelated profile field must not move this hot path away
+	// from the executable's exact implementation. Compare only the effects that
+	// can influence this particular tile before doing the neutral reconstruction.
+	unsigned int yield_identity = get_trait_identity_mask_for_leader (yield_leader);
+	if (tile_city == NULL) {
+		int native_desert_bonus = (yield_identity & RBF_Agricultural) ? 1 : 0;
+		if (yield_effects.irrigated_desert_food_bonus == native_desert_bonus)
+			return Map_calc_food_yield_at (this, __, tile_x, tile_y, tile_base_type, civ_id, imagine_fully_improved, city);
+	} else {
+		int owner_id = (unsigned char)tile_city->Body.CivID;
+		unsigned int owner_identity = get_trait_identity_mask_for_leader (&leaders[owner_id]);
+		int city_size = get_trait_yield_city_size (tile_city);
+		int native_center_bonus = (owner_identity & RBF_Agricultural) ? 1 : 0;
+		bool native_fresh_water_exception = (yield_identity & RBF_Agricultural) != 0;
+		if ((centre_effects.city_center_food_bonus[city_size] == native_center_bonus) &&
+		    (yield_effects.despotism_fresh_water_food_penalty_exception ==
+		     native_fresh_water_exception))
+			return Map_calc_food_yield_at (this, __, tile_x, tile_y, tile_base_type, civ_id, imagine_fully_improved, city);
+	}
+
+	Government * government = get_trait_yield_government_for_civ (civ_id);
+	Race * yield_race = get_trait_yield_race_for_civ (civ_id);
+	if ((government == NULL) || (yield_race == NULL))
+		return Map_calc_food_yield_at (this, __, tile_x, tile_y, tile_base_type, civ_id, imagine_fully_improved, city);
+
+	struct trait_yield_race_restore restores[2];
+	int restore_count = collect_trait_yield_races (civ_id, tile_city, restores);
+	int saved_tile_penalty = government->b_Standard_Tile_Penalty;
+	government->b_Standard_Tile_Penalty = 0;
+	set_trait_yield_race_bits (restores, restore_count,
+				   RBF_Agricultural, NULL, 0);
+	int neutral = Map_calc_food_yield_at (this, __, tile_x, tile_y,
+					      tile_base_type, civ_id,
+					      imagine_fully_improved, city);
+
+	long long result;
+	if (tile_city != NULL) {
+		int city_size = get_trait_yield_city_size (tile_city);
+		result = (long long)p_bic_data->General.FoodPerCitizen +
+			 centre_effects.city_center_food_bonus[city_size];
+	} else {
+		// A second stock evaluation with only Agricultural enabled is a
+		// robust predicate for the hard-coded irrigated-desert branch. It
+		// preserves all terrain/LM/fully-improved details without copying
+		// that algorithm here.
+		set_trait_yield_race_bits (restores, restore_count,
+					   RBF_Agricultural, yield_race,
+					   RBF_Agricultural);
+		int agricultural_probe = Map_calc_food_yield_at (
+			this, __, tile_x, tile_y, tile_base_type, civ_id,
+			imagine_fully_improved, city);
+		long long predicate_delta =
+			(long long)agricultural_probe - (long long)neutral;
+		result = (long long)neutral + predicate_delta *
+			 (long long)yield_effects.irrigated_desert_food_bonus;
+	}
+
+	restore_trait_yield_races (restores, restore_count);
+	government->b_Standard_Tile_Penalty = saved_tile_penalty;
+
+	bool skip_penalty = false;
+	if (saved_tile_penalty && (tile_city != NULL) &&
+	    yield_effects.despotism_fresh_water_food_penalty_exception &&
+	    ! is->current_config.no_penalty_exception_for_agri_fresh_water_city_tiles)
+		skip_penalty = this->vtable->has_fresh_water (
+			this, __, tile_x, tile_y) != 0;
+	if (saved_tile_penalty && ! skip_penalty && (result > 2))
+		result--;
+	return clamp_trait_yield (result);
 }
 
 int __fastcall
-patch_Map_calc_shield_yield_at (Map * this, int edx, int tile_x, int tile_y, int civ_id, City * city, int param_5, int param_6)
+patch_Map_calc_shield_yield_at (Map * this, int edx, int tile_x, int tile_y,
+				int tile_base_type, int civ_id,
+				int imagine_fully_improved, City * city)
 {
-	if (! is->current_config.enable_districts)
-		return Map_calc_shield_yield_at (this, __, tile_x, tile_y, civ_id, city, param_5, param_6);
-
 	Tile * tile = tile_at (tile_x, tile_y);
-	if ((tile != NULL) && (tile != p_null_tile)) {
+	if (is->current_config.enable_districts &&
+	    (tile != NULL) && (tile != p_null_tile)) {
 		struct district_instance * inst = get_district_instance (tile);
 		if (inst != NULL &&
 		    district_is_complete (tile, inst->district_id)) {
@@ -14315,17 +15868,114 @@ patch_Map_calc_shield_yield_at (Map * this, int edx, int tile_x, int tile_y, int
 		}
 	}
 
-	return Map_calc_shield_yield_at (this, __, tile_x, tile_y, civ_id, city, param_5, param_6);
+	if ((! trait_profile_effects_are_active ()) ||
+	    (tile == NULL) || (tile == p_null_tile) ||
+	    (tile->vtable->m20_Check_Pollution (tile, __, 0) != 0))
+		return Map_calc_shield_yield_at (this, __, tile_x, tile_y,
+						tile_base_type, civ_id, imagine_fully_improved, city);
+
+	Leader * yield_leader = ((civ_id >= 0) && (civ_id < 32)) ? &leaders[civ_id] : NULL;
+	struct trait_profile yield_effects;
+	if ((yield_leader == NULL) ||
+	    ! aggregate_trait_profiles_for_leader (yield_leader, 0, &yield_effects))
+		return Map_calc_shield_yield_at (this, __, tile_x, tile_y,
+						tile_base_type, civ_id, imagine_fully_improved, city);
+
+	City * tile_city = get_trait_yield_tile_city (tile);
+	if (Tile_has_city (tile) && (tile_city == NULL))
+		return Map_calc_shield_yield_at (this, __, tile_x, tile_y,
+						tile_base_type, civ_id, imagine_fully_improved, city);
+	if (tile_city == NULL)
+		return Map_calc_shield_yield_at (this, __, tile_x, tile_y,
+						tile_base_type, civ_id, imagine_fully_improved, city);
+	int city_size = get_trait_yield_city_size (tile_city);
+	int native_center_bonus =
+		((get_trait_identity_mask_for_leader (yield_leader) & RBF_Industrious) &&
+		 (city_size == TCS_METROPOLIS)) ? 1 : 0;
+	if (yield_effects.city_center_shield_bonus[city_size] == native_center_bonus)
+		return Map_calc_shield_yield_at (this, __, tile_x, tile_y,
+						tile_base_type, civ_id, imagine_fully_improved, city);
+	Government * government = get_trait_yield_government_for_civ (civ_id);
+	if ((government == NULL) || (get_trait_yield_race_for_civ (civ_id) == NULL))
+		return Map_calc_shield_yield_at (this, __, tile_x, tile_y,
+						tile_base_type, civ_id, imagine_fully_improved, city);
+
+	struct trait_yield_race_restore restores[2];
+	int restore_count = collect_trait_yield_races (civ_id, tile_city, restores);
+	int saved_tile_penalty = government->b_Standard_Tile_Penalty;
+	government->b_Standard_Tile_Penalty = 0;
+	set_trait_yield_race_bits (restores, restore_count,
+				   RBF_Industrious, NULL, 0);
+	int neutral_with_later = Map_calc_shield_yield_at (
+		this, __, tile_x, tile_y, tile_base_type, civ_id,
+		imagine_fully_improved, city);
+
+	// The stock city-centre floor is applied before Golden Age and
+	// mobilization bonuses. Adding a negative configured centre bonus to the
+	// already-floored final value would therefore be wrong (and adding a
+	// positive bonus to a naturally zero-shield town would overcount by one).
+	// Probe the same stock function with those two later bonuses disabled, then
+	// temporarily classify the centre as a metropolis. Stock always adds two
+	// base shields for a metropolis before its floor, which exposes the raw
+	// terrain/resource amount without copying that much larger algorithm.
+	int neutral_without_later = neutral_with_later;
+	int raw_before_city_size = neutral_without_later - city_size;
+	bool completed_base_probe = false;
+	if (p_bic_data->General.MaximumSize_City < INT_MAX) {
+		int saved_population_size = tile_city->Body.Population.Size;
+		int saved_golden_age_end = yield_leader->Golden_Age_End;
+		Leader * mobilization_owner = NULL;
+		int saved_mobilization_level = 0;
+		if ((city != NULL) && ((unsigned char)city->Body.CivID < 32)) {
+			mobilization_owner = &leaders[(unsigned char)city->Body.CivID];
+			saved_mobilization_level = mobilization_owner->Mobilization_Level;
+			mobilization_owner->Mobilization_Level = 0;
+		}
+		yield_leader->Golden_Age_End = *p_current_turn_no;
+		neutral_without_later = Map_calc_shield_yield_at (
+			this, __, tile_x, tile_y, tile_base_type, civ_id,
+			imagine_fully_improved, city);
+		tile_city->Body.Population.Size =
+			p_bic_data->General.MaximumSize_City + 1;
+		int metropolis_without_later = Map_calc_shield_yield_at (
+			this, __, tile_x, tile_y, tile_base_type, civ_id,
+			imagine_fully_improved, city);
+		tile_city->Body.Population.Size = saved_population_size;
+		yield_leader->Golden_Age_End = saved_golden_age_end;
+		if (mobilization_owner != NULL)
+			mobilization_owner->Mobilization_Level = saved_mobilization_level;
+		raw_before_city_size = metropolis_without_later - 2;
+		completed_base_probe = true;
+	}
+	restore_trait_yield_races (restores, restore_count);
+	government->b_Standard_Tile_Penalty = saved_tile_penalty;
+
+	long long result;
+	if (completed_base_probe) {
+		result = (long long)raw_before_city_size + city_size +
+			yield_effects.city_center_shield_bonus[city_size];
+		if (result < 1)
+			result = 1;
+		int later_bonus = neutral_with_later - neutral_without_later;
+		if (later_bonus > 0)
+			result += later_bonus;
+	} else {
+		// A ruleset with INT_MAX as its city-size threshold cannot have a
+		// metropolis probe. Preserve the safe stock-derived fallback there.
+		result = (long long)neutral_with_later +
+			yield_effects.city_center_shield_bonus[city_size];
+	}
+	if (saved_tile_penalty && (result > 2))
+		result--;
+	return clamp_trait_yield (result);
 }
 
 int __fastcall
 patch_Map_calc_commerce_yield_at (Map * this, int edx, int tile_x, int tile_y, int tile_base_type, int civ_id, int imagine_fully_improved, City * city)
 {
-	if (! is->current_config.enable_districts)
-		return Map_calc_commerce_yield_at (this, __, tile_x, tile_y, tile_base_type, civ_id, imagine_fully_improved, city);
-
 	Tile * tile = tile_at (tile_x, tile_y);
-	if ((tile != NULL) && (tile != p_null_tile)) {
+	if (is->current_config.enable_districts &&
+	    (tile != NULL) && (tile != p_null_tile)) {
 		struct district_instance * inst = get_district_instance (tile);
 		if (inst != NULL &&
 		    district_is_complete (tile, inst->district_id)) {
@@ -14347,7 +15997,134 @@ patch_Map_calc_commerce_yield_at (Map * this, int edx, int tile_x, int tile_y, i
 		}
 	}
 
-	return Map_calc_commerce_yield_at (this, __, tile_x, tile_y, tile_base_type, civ_id, imagine_fully_improved, city);
+	if ((! trait_profile_effects_are_active ()) ||
+	    (tile == NULL) || (tile == p_null_tile))
+		return Map_calc_commerce_yield_at (this, __, tile_x, tile_y, tile_base_type, civ_id, imagine_fully_improved, city);
+
+	// Commercial and Seafaring affect only actual city-centre tiles. Leaving
+	// all other tiles on the stock path also preserves every later commerce
+	// modifier exactly.
+	City * tile_city = get_trait_yield_tile_city (tile);
+	if ((tile_city == NULL) ||
+	    (tile->vtable->m20_Check_Pollution (tile, __, 0) != 0))
+		return Map_calc_commerce_yield_at (this, __, tile_x, tile_y, tile_base_type, civ_id, imagine_fully_improved, city);
+
+	int owner_id = (unsigned char)tile_city->Body.CivID;
+	Leader * yield_leader = ((civ_id >= 0) && (civ_id < 32)) ? &leaders[civ_id] : NULL;
+	Leader * owner = (owner_id < 32) ? &leaders[owner_id] : NULL;
+	struct trait_profile yield_effects;
+	Race * owner_race = get_trait_yield_race_for_civ (owner_id);
+	if ((yield_leader == NULL) || (owner == NULL) ||
+	    ! aggregate_trait_profiles_for_leader (yield_leader, 0, &yield_effects) ||
+	    (owner_race == NULL))
+		return Map_calc_commerce_yield_at (this, __, tile_x, tile_y, tile_base_type, civ_id, imagine_fully_improved, city);
+
+	int city_size = get_trait_yield_city_size (tile_city);
+	int native_center_bonus = 0;
+	if (get_trait_identity_mask_for_leader (yield_leader) & RBF_Commercial)
+		native_center_bonus = (city_size == TCS_CITY) ? 2 :
+			((city_size == TCS_METROPOLIS) ? 3 : 0);
+	int sea_id = City_get_largest_adjacent_sea (tile_city);
+	int water_tile_count = -1;
+	if ((p_bic_data->Map.Continents != NULL) &&
+	    (sea_id >= 0) && (sea_id < p_bic_data->Map.Continent_Count))
+		water_tile_count = p_bic_data->Map.Continents[sea_id].Body.TileCount;
+	unsigned int owner_traits = get_trait_identity_mask_for_race (owner_race);
+	int configured_coastal_bonus = 0;
+	if (water_tile_count >= 0)
+		for (int trait_id = 0; trait_id < COUNT_CIV_TRAITS; trait_id++) {
+			if ((owner_traits & (1u << trait_id)) == 0)
+				continue;
+			struct trait_profile const * profile = get_trait_profile (trait_id);
+			if ((profile != NULL) &&
+			    (water_tile_count >= profile->coastal_city_min_water_tiles))
+				configured_coastal_bonus += profile->coastal_city_center_commerce_bonus;
+		}
+	int native_coastal_bonus =
+		((owner_traits & RBF_Seafaring) && (water_tile_count >= 21)) ? 1 : 0;
+	if ((yield_effects.city_center_commerce_bonus[city_size] == native_center_bonus) &&
+	    (configured_coastal_bonus == native_coastal_bonus))
+		return Map_calc_commerce_yield_at (this, __, tile_x, tile_y, tile_base_type, civ_id, imagine_fully_improved, city);
+
+	Government * government = get_trait_yield_government_for_civ (civ_id);
+	if ((government == NULL) || (get_trait_yield_race_for_civ (civ_id) == NULL))
+		return Map_calc_commerce_yield_at (this, __, tile_x, tile_y, tile_base_type, civ_id, imagine_fully_improved, city);
+
+	struct trait_yield_race_restore restores[2];
+	int restore_count = collect_trait_yield_races (civ_id, tile_city, restores);
+	int saved_tile_penalty = government->b_Standard_Tile_Penalty;
+	int saved_capital_id = owner->CapitalID;
+	government->b_Standard_Tile_Penalty = 0;
+	owner->CapitalID = -1;
+	set_trait_yield_race_bits (restores, restore_count,
+				   RBF_Commercial | RBF_Seafaring,
+				   NULL, 0);
+	int neutral_with_later = Map_calc_commerce_yield_at (
+		this, __, tile_x, tile_y, tile_base_type, civ_id,
+		imagine_fully_improved, city);
+	int metropolis_neutral_with_later = neutral_with_later;
+	bool completed_base_probe = false;
+	if (p_bic_data->General.MaximumSize_City < INT_MAX) {
+		int saved_population_size = tile_city->Body.Population.Size;
+		tile_city->Body.Population.Size =
+			p_bic_data->General.MaximumSize_City + 1;
+		metropolis_neutral_with_later = Map_calc_commerce_yield_at (
+			this, __, tile_x, tile_y, tile_base_type, civ_id,
+			imagine_fully_improved, city);
+		tile_city->Body.Population.Size = saved_population_size;
+		completed_base_probe = true;
+	}
+	restore_trait_yield_races (restores, restore_count);
+	owner->CapitalID = saved_capital_id;
+	government->b_Standard_Tile_Penalty = saved_tile_penalty;
+
+	// The stock function applies these after city-centre bonuses and floors.
+	// Its neutral centre is always positive, so all applicable stock bonuses
+	// were included and can be removed deterministically before rebuilding the
+	// configured order below.
+	bool in_golden_age = *p_current_turn_no < yield_leader->Golden_Age_End;
+	int wonder_trade_bonus = 0;
+	if (city != NULL)
+		wonder_trade_bonus = Leader_count_wonders_with_flag (
+			yield_leader, __,
+			ITW_Plus_One_Trade_in_Each_Trade_Producing_Tile,
+			city);
+	if (wonder_trade_bonus < 0)
+		wonder_trade_bonus = 0;
+	long long stock_later = (in_golden_age ? 1LL : 0LL) +
+		(long long)wonder_trade_bonus +
+		(government->b_Standard_Trade_Bonus ? 1LL : 0LL);
+	long long result;
+	if (completed_base_probe) {
+		// With Commercial cleared and the capital floor disabled, a metropolis
+		// contributes exactly two stock centre commerce before the floor. This
+		// recovers the raw tile amount so configured negative or low positive
+		// bonuses are applied before the original capital/non-capital minimum.
+		result = (long long)metropolis_neutral_with_later -
+			stock_later - 2 + city_size;
+	} else
+		result = (long long)neutral_with_later - stock_later;
+
+	result += yield_effects.city_center_commerce_bonus[city_size];
+	if (tile_city->Body.ID == saved_capital_id) {
+		if (result < 4)
+			result = 4;
+	} else if (result < 1)
+		result = 1;
+
+	// Coastal commerce belongs to each individual possessed profile because
+	// every effect carries its own minimum water-body size.
+	result += configured_coastal_bonus;
+
+	if (in_golden_age && (result > 0))
+		result++;
+	if ((city != NULL) && (result > 0))
+		result += wonder_trade_bonus;
+	if (government->b_Standard_Trade_Bonus && (result > 0))
+		result++;
+	if (saved_tile_penalty && (result > 2))
+		result--;
+	return clamp_trait_yield (result);
 }
 
 int
@@ -17417,10 +19194,78 @@ set_nopification (int yes_or_no, byte * addr, int size)
 	}
 }
 
+static bool
+set_native_coastal_start_checks_suppressed (bool suppressed)
+{
+	static unsigned int invalid_sites_reported;
+	byte * coastal_start_check_sites[] = {
+		(byte *)ADDR_TRAIT_COASTAL_START_CHECK_1,
+		(byte *)ADDR_TRAIT_COASTAL_START_CHECK_2,
+		(byte *)ADDR_TRAIT_COASTAL_START_CHECK_3,
+		(byte *)ADDR_TRAIT_COASTAL_START_CHECK_4,
+		(byte *)ADDR_TRAIT_COASTAL_START_CHECK_5
+	};
+	bool recognized[ARRAY_LEN (coastal_start_check_sites)];
+	bool all_recognized = true;
+	for (int n = 0; n < ARRAY_LEN (coastal_start_check_sites); n++) {
+		byte * site = coastal_start_check_sites[n];
+		recognized[n] = site != NULL;
+		if (site == NULL) {
+			all_recognized = false;
+			continue;
+		}
+
+		// Steam is byte-verified and the GOG/PCG addresses are correlated from
+		// decompilation. Refuse to write unless the target still has the expected
+		// `push imm8` instruction, either native Seafaring (7) or our sentinel (8).
+		// This also makes the edit coexist safely with an unknown executable build
+		// or another patch that has claimed the same site.
+		if ((site[0] != 0x6A) ||
+		    ((site[1] != RB_Seafaring) && (site[1] != 8))) {
+			recognized[n] = false;
+			all_recognized = false;
+			unsigned int bit = 1u << n;
+			if ((invalid_sites_reported & bit) == 0) {
+				char message[180];
+				snprintf (message, sizeof message,
+					  "[C3X] Skipping unrecognized coastal-start patch site %d at %p (bytes %02X %02X).\n",
+					  n + 1, site, site[0], site[1]);
+				message[(sizeof message) - 1] = '\0';
+				(*p_OutputDebugStringA) (message);
+				invalid_sites_reported |= bit;
+			}
+		}
+	}
+
+	// Suppressing only some of the native swap sites would mix two assignment
+	// algorithms. If any site is unknown, restore every recognized site and let
+	// the game use its stock behavior for this map instead.
+	bool actually_suppress = suppressed && all_recognized;
+	for (int n = 0; n < ARRAY_LEN (coastal_start_check_sites); n++) {
+		byte * site = coastal_start_check_sites[n];
+		if (! recognized[n])
+			continue;
+		WITH_MEM_PROTECTION (site + 1, 1, PAGE_EXECUTE_READWRITE)
+			site[1] = actually_suppress ? 8 : RB_Seafaring;
+	}
+	return all_recognized;
+}
+
 void
 apply_machine_code_edits (struct c3x_config const * cfg, bool at_program_start)
 {
 	DWORD old_protect, unused;
+
+	// The native coastal-start code calls Race::CheckBonus at five swap sites
+	// after building one shared >20-water-tile bitmap. A sentinel bonus ID makes
+	// those calls return false while the profile-aware assignment below owns the
+	// complete permutation. Restore the original Seafaring ID on the vanilla,
+	// program-start, and network-multiplayer paths.
+	bool use_custom_coastal_starts =
+		(! at_program_start) &&
+		trait_coastal_start_config_differs_from_vanilla () &&
+		trait_profile_effects_are_active ();
+	set_native_coastal_start_checks_suppressed (use_custom_coastal_starts);
 
 	// Allow stealth attack against single unit
 	WITH_MEM_PROTECTION (ADDR_STEALTH_ATTACK_TARGET_COUNT_CHECK, 1, PAGE_EXECUTE_READWRITE)
@@ -22868,6 +24713,14 @@ patch_load_scenario (BIC * this, int edx, char * param_1, unsigned * param_2)
 	if ((ret_addr == ADDR_LOAD_SCENARIO_PREVIEW_RETURN) || (ret_addr == ADDR_LOAD_SCENARIO_RESUME_SAVE_2_RETURN))
 		return tr;
 
+	// A profile hash belongs to the save currently being loaded, not to the
+	// scenario or save that was previously open. Do this only after filtering
+	// preview and recursive loads so those internal calls cannot clear the
+	// compatibility state of the real load.
+	is->saved_trait_profiles_hash_present = false;
+	is->saved_trait_profiles_hash = 0;
+	is->trait_profiles_save_mismatch_reported = false;
+
 	reset_to_base_config ();
 	load_config ("default.c3x_config.ini", 1);
 	char * scenario_config_file_name = "scenario.c3x_config.ini";
@@ -22878,6 +24731,7 @@ patch_load_scenario (BIC * this, int edx, char * param_1, unsigned * param_2)
 		load_config (scenario_config_path, 0);
 	}
 	load_config ("custom.c3x_config.ini", 1);
+	load_trait_profile_configs ();
 	apply_machine_code_edits (&is->current_config, false);
 
 	if (is->current_config.enable_districts || is->current_config.enable_natural_wonders) {
@@ -25025,10 +26879,11 @@ ai_move_material_unit (Unit * this)
 	Unit_set_state (this, __, UnitState_Fortifying);
 }
 
-int __stdcall
-patch_get_anarchy_length (int leader_id)
+int __fastcall patch_Leader_get_optimal_city_number (Leader * this);
+
+static int
+apply_legacy_anarchy_length_multiplier (int base)
 {
-	int base = get_anarchy_length (leader_id);
 	int multiplier = is->current_config.anarchy_length_percent;
 	if (multiplier != 100) {
 		// Anarchy cannot be less than 2 turns or you'll get an instant government switch. Only let that happen when the percent multiplier is
@@ -25041,6 +26896,174 @@ patch_get_anarchy_length (int leader_id)
 			return not_below (2, rand_div (base * multiplier, 100));
 	} else
 		return base;
+}
+
+int __stdcall
+patch_get_anarchy_length (int leader_id)
+{
+	Leader * leader = &leaders[leader_id];
+	if (! trait_profile_effects_are_active ())
+		return apply_legacy_anarchy_length_multiplier (get_anarchy_length (leader_id));
+
+	struct trait_profile effects;
+	if (! aggregate_trait_profiles_for_leader (leader, 0, &effects))
+		return apply_legacy_anarchy_length_multiplier (get_anarchy_length (leader_id));
+
+	bool has_native_religious_effect =
+		(get_trait_identity_mask_for_leader (leader) & RBF_Religious) != 0;
+	int native_fixed_turns = has_native_religious_effect ? 2 : TRAIT_NO_FIXED_ANARCHY;
+	if ((effects.anarchy_fixed_turns == native_fixed_turns) &&
+	    (effects.anarchy_length_percent == 100))
+		return apply_legacy_anarchy_length_multiplier (get_anarchy_length (leader_id));
+
+	int base;
+	bool fixed_length = effects.anarchy_fixed_turns >= 0;
+	if (fixed_length)
+		base = effects.anarchy_fixed_turns;
+	else {
+		// This is the stock non-Religious formula. Keep the two separate calls to
+		// rand_int(3), since their order is part of the synchronized game state.
+		int first_roll = rand_int (p_rand_object, __, 3) & 0xffff;
+		int second_roll = rand_int (p_rand_object, __, 3) & 0xffff;
+		int city_factor = (leader->Cities_Count * 3) /
+			patch_Leader_get_optimal_city_number (leader);
+		city_factor = not_above (3, city_factor);
+		base = 2 + first_roll + second_roll + city_factor;
+
+		// For AI players, a nonzero Transition_Time is an upper bound. The
+		// original Religious fixed length bypasses this cap, so custom fixed
+		// lengths do as well.
+		if (((*p_human_player_bits & (1 << leader->ID)) == 0) &&
+		    (p_bic_data->DifficultyLevels[*p_game_difficulty].Transition_Time > 0))
+			base = not_above (
+				p_bic_data->DifficultyLevels[*p_game_difficulty].Transition_Time,
+				base);
+	}
+
+	int legacy_percent = is->current_config.anarchy_length_percent;
+	if (legacy_percent < 0)
+		return 1;
+
+	// Trait and legacy percentages are one combined scale. Use a 64-bit
+	// intermediate and one deterministic half-up rounding step, avoiding any
+	// extra RNG beyond the stock two rand_int(3) calls above.
+	int trait_percent = not_below (0, effects.anarchy_length_percent);
+	long long scaled = (long long)base * trait_percent * legacy_percent;
+	long long rounded = (scaled + 5000) / 10000;
+	int result = (rounded > INT_MAX) ? INT_MAX : (int)rounded;
+	// Fixed 0 and 1 are explicit supported values. Only the random formula
+	// keeps the legacy two-turn safety floor.
+	return fixed_length ? result : not_below (2, result);
+}
+
+int __fastcall
+patch_Leader_get_building_cost (Leader * this, int edx, int improvement_id, bool ignore_difficulty)
+{
+	if ((! trait_profile_effects_are_active ()) ||
+	    (this == NULL) || (this->ID < 0) || (this->ID >= 32) ||
+	    (improvement_id < 0) ||
+	    (improvement_id >= p_bic_data->ImprovementsCount))
+		return Leader_get_building_cost (this, __, improvement_id, ignore_difficulty);
+
+	Improvement * improvement = &p_bic_data->Improvements[improvement_id];
+	if ((improvement->Characteristics & (ITC_Wonder | ITC_Small_Wonder)) != 0)
+		return Leader_get_building_cost (this, __, improvement_id, ignore_difficulty);
+
+	struct trait_profile effects;
+	if (! aggregate_trait_profiles_for_leader (this, improvement->Characteristics, &effects))
+		return Leader_get_building_cost (this, __, improvement_id, ignore_difficulty);
+	unsigned int identity = get_trait_identity_mask_for_leader (this);
+	bool native_discount =
+		((identity & RBF_Militaristic) && (improvement->Characteristics & ITC_Militaristic)) ||
+		((identity & RBF_Scientific)   && (improvement->Characteristics & ITC_Scientific)) ||
+		((identity & RBF_Religious)    && (improvement->Characteristics & ITC_Religious)) ||
+		((identity & RBF_Agricultural) && (improvement->Characteristics & ITC_Agricultural)) ||
+		((identity & RBF_Seafaring)    && (improvement->Characteristics & ITC_Seafaring));
+	if (effects.building_cost_percent == (native_discount ? 50 : 100))
+		return Leader_get_building_cost (this, __, improvement_id, ignore_difficulty);
+
+	int cost_factor;
+	if (((*p_human_player_bits & (1u << this->ID)) == 0) && (! ignore_difficulty))
+		cost_factor = p_bic_data->DifficultyLevels[*p_game_difficulty].Cost_Factor;
+	else
+		cost_factor = 10;
+	if ((*p_toggleable_rules & TR_ACCELERATED_PRODUCTION) != 0)
+		cost_factor /= 2;
+	if (cost_factor < 1)
+		cost_factor = 1;
+
+	long long unscaled_cost = (long long)cost_factor * improvement->Cost;
+	long long cost;
+	if ((unscaled_cost <= 0) || (effects.building_cost_percent == 0))
+		cost = 0;
+	else {
+		// The parser permits a cost percentage up to 10000. Clamp before the
+		// multiply so an extreme BIQ cost cannot overflow the 64-bit
+		// intermediate merely to be clamped back to INT_MAX below.
+		long long largest_unclamped =
+			((long long)INT_MAX * 100) / effects.building_cost_percent;
+		if (unscaled_cost > largest_unclamped)
+			return INT_MAX;
+		cost = unscaled_cost * effects.building_cost_percent / 100;
+	}
+
+	if ((improvement->ImprovementFlags & ITF_Center_of_Empire) != 0) {
+		int base_ocn = p_bic_data->WorldSizes[p_bic_data->Map.World.World_Size].OptimalCityCount;
+		if (base_ocn > 0) {
+			long long scaled_cities = (long long)this->Cities_Count * 6;
+			int multiplier = (scaled_cities > INT_MAX) ? INT_MAX :
+					 (int)(scaled_cities / base_ocn);
+			if (multiplier < 3)
+				multiplier = 3;
+			else if (multiplier > 10)
+				multiplier = 10;
+			cost *= multiplier;
+		}
+	}
+
+	if (cost < 1)
+		return 1;
+	if (cost > INT_MAX)
+		return INT_MAX;
+	return (int)cost;
+}
+
+int __fastcall
+patch_Unit_get_worker_strength (Unit * this, int edx, int job_id)
+{
+	if ((! trait_profile_effects_are_active ()) || (this == NULL) ||
+	    (this->Body.CivID < 0) || (this->Body.CivID >= 32) ||
+	    (this->Body.UnitTypeID < 0) || (this->Body.UnitTypeID >= p_bic_data->UnitTypeCount))
+		return Unit_get_worker_strength (this, __, job_id);
+
+	Leader * owner = &leaders[this->Body.CivID];
+	if ((owner->GovernmentType < 0) || (owner->GovernmentType >= p_bic_data->GovernmentsCount))
+		return Unit_get_worker_strength (this, __, job_id);
+
+	struct trait_profile effects;
+	if (! aggregate_trait_profiles_for_leader (owner, 0, &effects))
+		return Unit_get_worker_strength (this, __, job_id);
+	int native_percent =
+		(get_trait_identity_mask_for_leader (owner) & RBF_Industrious) ? 150 : 100;
+	if (effects.worker_rate_percent == native_percent)
+		return Unit_get_worker_strength (this, __, job_id);
+
+	// This preserves the original FPU expression and truncation order, replacing
+	// only Industrious' fixed x1.5 term with the configured aggregate percent.
+	float strength = (float)p_bic_data->Governments[owner->GovernmentType].WorkRate;
+	strength *= (float)effects.worker_rate_percent / 100.0f;
+	if (Leader_has_tech_with_flag (owner, __, ATF_Doubles_Work_Rate_Of_Workers))
+		strength *= 2.0f;
+	if (owner->RaceID != this->Body.RaceID)
+		strength *= 0.5f;
+	strength *= p_bic_data->UnitTypes[this->Body.UnitTypeID].WorkerStrength;
+
+	if (strength >= (float)INT_MAX)
+		return INT_MAX;
+	if (strength < 1.0f)
+		return 1;
+	int result = (int)strength;
+	return result;
 }
 
 bool __fastcall
@@ -27531,6 +29554,22 @@ patch_Map_process_after_placing (Map * this, int edx, bool param_1)
 void __fastcall
 patch_Map_impl_generate (Map * this, int edx, int seed, bool is_multiplayer_game, int num_seafaring_civs)
 {
+	// A fresh generated map needs its own one-shot assignment even when the
+	// player starts another game without causing the scenario/config to reload.
+	is->trait_coastal_start_assignment_done = false;
+	bool use_custom_coastal_starts =
+		trait_coastal_start_config_differs_from_vanilla () &&
+		trait_profile_effects_are_active ();
+	// A scenario can be loaded before a network lobby has fully established its
+	// online state. Re-evaluate the five native CheckBonus sites at the actual
+	// map-generation boundary, so entering or leaving network multiplayer
+	// without another scenario load still restores the exact stock path.
+	bool coastal_sites_ready =
+		set_native_coastal_start_checks_suppressed (use_custom_coastal_starts);
+	use_custom_coastal_starts = use_custom_coastal_starts && coastal_sites_ready;
+	is->trait_custom_coastal_start_runtime_enabled = use_custom_coastal_starts;
+	if (use_custom_coastal_starts)
+		num_seafaring_civs = count_configured_coastal_start_civs ();
 	Map_impl_generate (this, __, seed, is_multiplayer_game, num_seafaring_civs);
 
 	if (is->current_config.enable_natural_wonders)
@@ -29040,7 +31079,10 @@ patch_Leader_unlock_technology (Leader * this, int edx, int tech_id, bool param_
 	int * p_stack = (int *)&tech_id;
 	int ret_addr = p_stack[-1];
 
+	Leader * previous_trait_context = is->trait_unlock_technology_leader;
+	is->trait_unlock_technology_leader = trait_profile_effects_are_active () ? this : NULL;
 	Leader_unlock_technology (this, __, tech_id, param_2, param_3, param_4);
+	is->trait_unlock_technology_leader = previous_trait_context;
 
 	// If this method was not called during game initialization
 	if ((ret_addr != ADDR_UNLOCK_TECH_AT_INIT_1) &&
@@ -29059,6 +31101,44 @@ patch_Leader_unlock_technology (Leader * this, int edx, int tech_id, bool param_
 				Leader_recompute_buildings_maintenance (this);
 		}
 	}
+}
+
+int __fastcall
+patch_rand_int_for_trait_scientific_leader (void * this, int edx, int lim)
+{
+	Leader * leader = is->trait_unlock_technology_leader;
+	if ((leader == NULL) || (! trait_profile_effects_are_active ()) || (lim <= 0))
+		return rand_int (this, __, lim);
+
+	struct trait_profile effects;
+	if (! aggregate_trait_profiles_for_leader (leader, 0, &effects))
+		return rand_int (this, __, lim);
+
+	// Compare against the bit the original caller actually observed. The
+	// free-era-tech wrapper may temporarily change Scientific so the stock
+	// branch grants (or suppresses) its first technology while an identity
+	// override keeps profile aggregation tied to the civilization's real
+	// traits. Using the overridden identity here would incorrectly accept the
+	// caller's temporary 5%/3% threshold as if it were the configured one.
+	Race * race = ((leader->RaceID >= 0) &&
+		      (leader->RaceID < p_bic_data->RacesCount)) ?
+		     &p_bic_data->Races[leader->RaceID] : NULL;
+	int native_chance = 30 +
+		((race != NULL) && (race->Bonuses & RBF_Scientific) ? 20 : 0);
+	int effective_chance = 30 + effects.scientific_great_leader_chance_bonus_per_mille;
+	if (effective_chance < 0)
+		effective_chance = 0;
+	else if (effective_chance > 1000)
+		effective_chance = 1000;
+
+	if (effective_chance == native_chance)
+		return rand_int (this, __, lim);
+
+	// The caller still compares against its native 3/5 threshold. Encode the
+	// result of one per-mille draw as an unambiguous success/failure value so
+	// the caller retains all original spawning, UI, and synchronization logic.
+	int roll = rand_int (this, __, 1000);
+	return roll < effective_chance ? 0 : 0xFFFF;
 }
 
 int __fastcall
@@ -30019,7 +32099,7 @@ check_life_after_zoc (Unit * unit, Unit * interceptor)
 		    ((p_bic_data->UnitTypes[unit->Body.UnitTypeID].Unit_Class != interceptor_type->Unit_Class) ||
 		     (interceptor_type->Bombard_Strength >= Unit_get_attack_strength (interceptor))))
 			is->do_not_enslave_units = true;
-		Unit_score_kill (interceptor, __, unit, false);
+		patch_Unit_score_kill (interceptor, __, unit, false);
 		is->do_not_enslave_units = false;
 
 		if ((! is_online_game ()) && Fighter_check_combat_anim_visibility (&p_bic_data->fighter, __, interceptor, unit, true))
@@ -30873,18 +32953,109 @@ patch_Unit_get_defense_strength (Unit * this)
 }
 
 void __fastcall
+patch_Unit_score_kill (Unit * this, int edx, Unit * victim, bool was_attacking)
+{
+	Unit * previous = is->trait_score_kill_unit;
+	is->trait_score_kill_unit = trait_profile_effects_are_active () ? this : NULL;
+	Unit_score_kill (this, __, victim, was_attacking);
+	is->trait_score_kill_unit = previous;
+}
+
+int __fastcall
+patch_rand_int_for_trait_promotion (void * this, int edx, int lim)
+{
+	Unit * unit = is->trait_score_kill_unit;
+	if ((unit == NULL) || (! trait_profile_effects_are_active ()) ||
+	    (unit->Body.CivID < 0) || (unit->Body.CivID >= 32) || (lim <= 0))
+		return rand_int (this, __, lim);
+
+	Leader * owner = &leaders[unit->Body.CivID];
+	struct trait_profile effects;
+	if (! aggregate_trait_profiles_for_leader (owner, 0, &effects))
+		return rand_int (this, __, lim);
+
+	unsigned int identity = get_trait_identity_mask_for_leader (owner);
+	int native_percent = (identity & RBF_Militaristic) ? 200 : 100;
+	int effective_percent = effects.promotion_chance_percent;
+	if (effective_percent == native_percent)
+		return rand_int (this, __, lim);
+
+	// The executable has already divided the native denominator by two for a
+	// Militaristic owner. Recover the neutral denominator, then draw exactly
+	// once from a fixed-point range so arbitrary integer percentages do not add
+	// a second RNG call.
+	int neutral_denominator = lim * ((identity & RBF_Militaristic) ? 2 : 1);
+	int random_limit = neutral_denominator * 100;
+	if (random_limit <= 0)
+		return rand_int (this, __, lim);
+	int threshold = effective_percent;
+	if (threshold < 0)
+		threshold = 0;
+	else if (threshold > random_limit)
+		threshold = random_limit;
+	int roll = rand_int (this, __, random_limit);
+	return roll < threshold ? 0 : 1;
+}
+
+void __fastcall
+patch_Unit_begin_turn (Unit * this)
+{
+	Unit * previous = is->trait_begin_turn_unit;
+	is->trait_begin_turn_unit = trait_profile_effects_are_active () ? this : NULL;
+	Unit_begin_turn (this);
+	is->trait_begin_turn_unit = previous;
+}
+
+int __fastcall
+patch_rand_int_for_trait_sinking (void * this, int edx, int lim)
+{
+	Unit * unit = is->trait_begin_turn_unit;
+	if ((unit == NULL) || (! trait_profile_effects_are_active ()) ||
+	    (unit->Body.CivID < 0) || (unit->Body.CivID >= 32) || (lim <= 0))
+		return rand_int (this, __, lim);
+
+	Tile * tile = tile_at (unit->Body.X, unit->Body.Y);
+	if ((tile == NULL) || (tile == p_null_tile))
+		return rand_int (this, __, lim);
+	int base_type = tile->vtable->m50_Get_Square_BaseType (tile);
+	bool is_sea = base_type == 0x0C;
+	bool is_ocean = base_type == 0x0D;
+	if ((! is_sea) && (! is_ocean))
+		return rand_int (this, __, lim);
+
+	Leader * owner = &leaders[unit->Body.CivID];
+	struct trait_profile effects;
+	if (! aggregate_trait_profiles_for_leader (owner, 0, &effects))
+		return rand_int (this, __, lim);
+	int chance = is_sea ? effects.sea_sinking_chance_per_mille :
+				      effects.ocean_sinking_chance_per_mille;
+	if (chance < 0)
+		chance = 500;
+	if (chance > 1000)
+		chance = 1000;
+
+	unsigned int identity = get_trait_identity_mask_for_leader (owner);
+	int native_chance = (identity & RBF_Seafaring) ? 250 : 500;
+	if (chance == native_chance)
+		return rand_int (this, __, lim);
+
+	int roll = rand_int (this, __, 1000);
+	return roll < chance ? 0 : 1;
+}
+
+void __fastcall
 patch_Unit_score_kill_by_defender (Unit * this, int edx, Unit * victim, bool was_attacking)
 {
 	// This function is called when the defender wins in combat. If the attacker was actually killed by defensive bombardment, then award credit
 	// for that kill to the defensive bombarder not the defender in combat.
 	if (is->dbe.defender_was_destroyed) {
 		is->do_not_enslave_units = is->current_config.prevent_enslaving_by_bombardment;
-		Unit_score_kill (is->dbe.bombarder, __, victim, was_attacking);
+		patch_Unit_score_kill (is->dbe.bombarder, __, victim, was_attacking);
 		is->do_not_enslave_units = false;
 		p_bic_data->fighter.play_animations = is->dbe.saved_animation_setting;
 
 	} else
-		Unit_score_kill (this, __, victim, was_attacking);
+		patch_Unit_score_kill (this, __, victim, was_attacking);
 }
 
 void __fastcall
@@ -31250,15 +33421,77 @@ patch_Demographics_Form_m22_draw (Demographics_Form * this)
 int __fastcall
 patch_Leader_get_optimal_city_number (Leader * this)
 {
-	if (! is->current_config.strengthen_forbidden_palace_ocn_effect)
-		return Leader_get_optimal_city_number (this);
-	else {
-		int num_sans_fp = Leader_get_optimal_city_number (this), // OCN w/o contrib from num of FPs
-		    fp_count = patch_Leader_count_wonders_with_small_flag (this, __, ITSW_Reduces_Corruption, NULL),
-		    s_diff = p_bic_data->DifficultyLevels[this->player_difficulty].Optimal_Cities, // Difficulty scaling, called "percentage of optimal cities" in the editor
-		    base_ocn = p_bic_data->WorldSizes[p_bic_data->Map.World.World_Size].OptimalCityCount;
-		return num_sans_fp + (s_diff * fp_count * base_ocn + 50) / 100; // Add 50 to round off
+	struct trait_profile effects;
+	bool use_custom_effect =
+		trait_profile_effects_are_active () &&
+		aggregate_trait_profiles_for_leader (this, 0, &effects);
+	int native_commercial_bonus = use_custom_effect &&
+		(get_trait_identity_mask_for_leader (this) & RBF_Commercial) ? 25 : 0;
+	if ((! use_custom_effect) ||
+	    (effects.optimal_city_number_bonus_percent == native_commercial_bonus)) {
+		if (! is->current_config.strengthen_forbidden_palace_ocn_effect)
+			return Leader_get_optimal_city_number (this);
+		else {
+			int num_sans_fp = Leader_get_optimal_city_number (this), // OCN w/o contrib from num of FPs
+			    fp_count = patch_Leader_count_wonders_with_small_flag (this, __, ITSW_Reduces_Corruption, NULL),
+			    s_diff = p_bic_data->DifficultyLevels[this->player_difficulty].Optimal_Cities, // Difficulty scaling, called "percentage of optimal cities" in the editor
+			    base_ocn = p_bic_data->WorldSizes[p_bic_data->Map.World.World_Size].OptimalCityCount;
+			long long result = (long long)num_sans_fp +
+				((long long)s_diff * fp_count * base_ocn + 50) / 100; // Add 50 to round off
+			if (result > INT_MAX)
+				return INT_MAX;
+			if (result < INT_MIN)
+				return INT_MIN;
+			return (int)result;
+		}
 	}
+
+	int base_ocn = p_bic_data->WorldSizes[p_bic_data->Map.World.World_Size].OptimalCityCount;
+	Government * govt = &p_bic_data->Governments[this->GovernmentType];
+	int fp_count = patch_Leader_count_wonders_with_small_flag (
+		this, __, ITSW_Reduces_Corruption, NULL);
+	long long raw_ocn = base_ocn;
+
+	if (! is->current_config.strengthen_forbidden_palace_ocn_effect) {
+		int fp_divisor = (govt->CorruptionAndWaste == CWT_Communal) ? 1 : 8;
+		raw_ocn += ((long long)fp_count * base_ocn * 3) / fp_divisor;
+	}
+
+	// Replace the stock Commercial base/4 term with the aggregate profile
+	// percentage while preserving every other stock contribution and its
+	// integer truncation point.
+	raw_ocn += ((long long)base_ocn * effects.optimal_city_number_bonus_percent) / 100;
+	switch (govt->CorruptionAndWaste) {
+		case CWT_Minimal:
+		case CWT_Nuisance:
+			raw_ocn += base_ocn / 8;
+			break;
+		case CWT_Problematic:
+			raw_ocn += base_ocn / 16;
+			break;
+		case CWT_Communal:
+			raw_ocn += base_ocn * 2;
+			break;
+		default:
+			break;
+	}
+
+	if ((*p_human_player_bits & (1 << this->ID)) == 0) {
+		if (*p_game_difficulty == 3)
+			raw_ocn += base_ocn / 8;
+		else if (*p_game_difficulty == 4)
+			raw_ocn += base_ocn / 4;
+		else if (*p_game_difficulty >= 5)
+			raw_ocn += base_ocn / 2;
+	}
+
+	int s_diff = p_bic_data->DifficultyLevels[this->player_difficulty].Optimal_Cities;
+	long long result = ((long long)s_diff * raw_ocn) / 100;
+	if (result < 1)
+		result = 1;
+	if (is->current_config.strengthen_forbidden_palace_ocn_effect)
+		result += ((long long)s_diff * fp_count * base_ocn + 50) / 100;
+	return result > INT_MAX ? INT_MAX : (int)result;
 }
 
 int __fastcall
@@ -31772,8 +34005,231 @@ patch_Leader_spawn_captured_unit (Leader * this, int edx, int type_id, int tile_
 void __fastcall
 patch_Leader_enter_new_era (Leader * this, int edx, bool param_1, bool no_online_sync)
 {
+	if (! trait_profile_effects_are_active ()) {
+		Leader_enter_new_era (this, __, param_1, no_online_sync);
+		apply_era_specific_names (this);
+		return;
+	}
+
+	struct trait_profile effects;
+	if ((! aggregate_trait_profiles_for_leader (this, 0, &effects)) ||
+	    (this->RaceID < 0) || (this->RaceID >= p_bic_data->RacesCount)) {
+		Leader_enter_new_era (this, __, param_1, no_online_sync);
+		apply_era_specific_names (this);
+		return;
+	}
+
+	unsigned int identity = get_trait_identity_mask_for_leader (this);
+	int native_count = (identity & RBF_Scientific) ? 1 : 0;
+	int configured_count = effects.free_era_tech_count;
+	if (configured_count == native_count) {
+		Leader_enter_new_era (this, __, param_1, no_online_sync);
+		apply_era_specific_names (this);
+		return;
+	}
+
+	Race * race = &p_bic_data->Races[this->RaceID];
+	int saved_bonuses = race->Bonuses;
+	bool pushed = push_trait_identity_override (race, identity);
+	if (! pushed) {
+		Leader_enter_new_era (this, __, param_1, no_online_sync);
+		apply_era_specific_names (this);
+		return;
+	}
+	if (configured_count > 0)
+		race->Bonuses |= RBF_Scientific;
+	else
+		race->Bonuses &= ~RBF_Scientific;
 	Leader_enter_new_era (this, __, param_1, no_online_sync);
+	race->Bonuses = saved_bonuses;
+	pop_trait_identity_override (pushed);
+
+	// The original branch supplied the first configured advance. Custom
+	// profiles may request more; each selector call consumes exactly one native
+	// random draw only when a candidate exists.
+	for (int n = 1; n < configured_count; n++) {
+		int tech_id = Leader_select_free_era_technology (this, __, true);
+		if (tech_id < 0)
+			break;
+		// Match the native era-entry call exactly: the middle unlock flag is
+		// param_1. no_online_sync controls the enclosing era transition only.
+		patch_Leader_unlock_technology (this, __, tech_id, false, param_1, false);
+	}
 	apply_era_specific_names (this);
+}
+
+void __fastcall
+patch_Leader_initialize_at_game_start (Leader * this, int edx, int race_id)
+{
+	apply_custom_coastal_start_assignment_once (this, race_id);
+
+	// The game first invokes this function for all 32 slots with race_id == -1
+	// to reset them. Never reuse a slot's stale this->RaceID on that pass: doing
+	// so could append custom scouts after the original reset and leave ghost
+	// units behind when starting a second game in the same process.
+	Race * race = ((race_id >= 0) && (race_id < p_bic_data->RacesCount)) ?
+		     &p_bic_data->Races[race_id] : NULL;
+
+	if ((! trait_profile_effects_are_active ()) || (race == NULL)) {
+		Leader_initialize_at_game_start (this, __, race_id);
+		return;
+	}
+
+	struct trait_profile effects;
+	if (! aggregate_trait_profiles_for_race (race, 0, &effects)) {
+		Leader_initialize_at_game_start (this, __, race_id);
+		return;
+	}
+	unsigned int identity = get_trait_identity_mask_for_race (race);
+	int native_count = (identity & RBF_Expansionist) ? 1 : 0;
+	int configured_count = effects.starting_scout_count;
+	if (configured_count == native_count) {
+		Leader_initialize_at_game_start (this, __, race_id);
+		return;
+	}
+
+	int saved_bonuses = race->Bonuses;
+	bool pushed = push_trait_identity_override (race, identity);
+	if (! pushed) {
+		Leader_initialize_at_game_start (this, __, race_id);
+		return;
+	}
+	if (configured_count > 0)
+		race->Bonuses |= RBF_Expansionist;
+	else
+		race->Bonuses &= ~RBF_Expansionist;
+	Leader_initialize_at_game_start (this, __, race_id);
+	race->Bonuses = saved_bonuses;
+	pop_trait_identity_override (pushed);
+
+	if ((configured_count <= 1) || (this == NULL) ||
+	    (this->ID <= 0) || (this->ID >= 32) ||
+	    (this->RaceID != race_id) ||
+	    ((*p_player_bits & (1u << this->ID)) == 0) ||
+	    (p_bic_data->General.DefaultUnit_Scout < 0) ||
+	    (p_bic_data->General.DefaultUnit_Scout >= p_bic_data->UnitTypeCount))
+		return;
+	int start_index = p_bic_data->Map.Starting_Locations[this->ID];
+	if ((start_index < 0) || (start_index >= p_bic_data->Map.TileCount))
+		return;
+
+	int scout_type = p_bic_data->General.DefaultUnit_Scout;
+	for (int candidate = p_bic_data->UnitTypes[scout_type].UpgradeToID;
+	     candidate >= 0 && candidate < p_bic_data->UnitTypeCount;
+	     candidate = p_bic_data->UnitTypes[candidate].UpgradeToID)
+		if (Leader_can_build_unit (this, __, candidate, 0, false))
+			scout_type = candidate;
+
+	int start_x, start_y;
+	tile_index_to_coords (&p_bic_data->Map, start_index, &start_x, &start_y);
+	for (int n = 1; n < configured_count; n++)
+		patch_Leader_spawn_unit (this, __, scout_type, start_x, start_y,
+					 -1, -1, false, (LeaderKind)0, -1);
+}
+
+static void
+set_temporary_expansionist_bit_for_hut_result (Leader * leader, int result)
+{
+	if ((leader == NULL) || (leader->RaceID < 0) ||
+	    (leader->RaceID >= p_bic_data->RacesCount))
+		return;
+	struct trait_profile effects;
+	if (! aggregate_trait_profiles_for_leader (leader, 0, &effects))
+		return;
+	bool enable = ((result == 2) && effects.goody_huts_allow_free_city) ||
+		      ((result == 7) && effects.goody_huts_never_barbarians);
+	Race * race = &p_bic_data->Races[leader->RaceID];
+	if (enable)
+		race->Bonuses |= RBF_Expansionist;
+	else
+		race->Bonuses &= ~RBF_Expansionist;
+}
+
+int __fastcall
+patch_Leader_roll_for_goody_hut_result (Leader * this)
+{
+	if (! trait_profile_effects_are_active ())
+		return Leader_roll_for_goody_hut_result (this);
+	struct trait_profile effects;
+	if ((! aggregate_trait_profiles_for_leader (this, 0, &effects)) ||
+	    (this->RaceID < 0) || (this->RaceID >= p_bic_data->RacesCount))
+		return Leader_roll_for_goody_hut_result (this);
+
+	unsigned int identity = get_trait_identity_mask_for_leader (this);
+	Race * race = &p_bic_data->Races[this->RaceID];
+	// The receive wrapper temporarily changes Expansionist to accept or reject
+	// result 2/7, and a rejection can recursively roll again. Compare the table
+	// bonus with the physical bit seen by the original roller so that recursive
+	// rolls still use the configured table rather than inheriting that temporary
+	// acceptance bit.
+	int native_bonus = (race->Bonuses & RBF_Expansionist) ? 1 : 0;
+	int result;
+	if (effects.goody_hut_table_bonus == native_bonus) {
+		result = Leader_roll_for_goody_hut_result (this);
+	} else {
+		int saved_bonuses = race->Bonuses;
+		int saved_difficulty = this->player_difficulty;
+		int table_index = saved_difficulty + 1 - effects.goody_hut_table_bonus;
+		if (table_index < 0)
+			table_index = 0;
+		else if (table_index > 8)
+			table_index = 8;
+		bool pushed = push_trait_identity_override (race, identity);
+		if (! pushed) {
+			result = Leader_roll_for_goody_hut_result (this);
+			if (is->trait_goody_hut_receiver_leader == this)
+				set_temporary_expansionist_bit_for_hut_result (this, result);
+			return result;
+		}
+		race->Bonuses &= ~RBF_Expansionist;
+		this->player_difficulty = table_index - 1;
+		result = Leader_roll_for_goody_hut_result (this);
+		this->player_difficulty = saved_difficulty;
+		race->Bonuses = saved_bonuses;
+		pop_trait_identity_override (pushed);
+	}
+
+	if (is->trait_goody_hut_receiver_leader == this)
+		set_temporary_expansionist_bit_for_hut_result (this, result);
+	return result;
+}
+
+void __fastcall
+patch_Leader_receive_goody_hut_result (Leader * this, int edx, int x, int y,
+				       int result, bool * stop, Unit * unit)
+{
+	if (! trait_profile_effects_are_active ()) {
+		Leader_receive_goody_hut_result (this, __, x, y, result, stop, unit);
+		return;
+	}
+	struct trait_profile effects;
+	if ((! aggregate_trait_profiles_for_leader (this, 0, &effects)) ||
+	    (this->RaceID < 0) || (this->RaceID >= p_bic_data->RacesCount)) {
+		Leader_receive_goody_hut_result (this, __, x, y, result, stop, unit);
+		return;
+	}
+	unsigned int identity = get_trait_identity_mask_for_leader (this);
+	bool native_expansionist = (identity & RBF_Expansionist) != 0;
+	if ((effects.goody_huts_allow_free_city == native_expansionist) &&
+	    (effects.goody_huts_never_barbarians == native_expansionist)) {
+		Leader_receive_goody_hut_result (this, __, x, y, result, stop, unit);
+		return;
+	}
+
+	Race * race = &p_bic_data->Races[this->RaceID];
+	int saved_bonuses = race->Bonuses;
+	Leader * previous = is->trait_goody_hut_receiver_leader;
+	bool pushed = push_trait_identity_override (race, identity);
+	if (! pushed) {
+		Leader_receive_goody_hut_result (this, __, x, y, result, stop, unit);
+		return;
+	}
+	is->trait_goody_hut_receiver_leader = this;
+	set_temporary_expansionist_bit_for_hut_result (this, result);
+	Leader_receive_goody_hut_result (this, __, x, y, result, stop, unit);
+	is->trait_goody_hut_receiver_leader = previous;
+	race->Bonuses = saved_bonuses;
+	pop_trait_identity_override (pushed);
 }
 
 char * __fastcall
@@ -32687,8 +35143,12 @@ void * __fastcall
 patch_MappedFile_open_to_load_game (MappedFile * this, int edx, char * file_name, int sequential_access)
 {
 	void * tr = MappedFile_open (this, __, file_name, sequential_access);
-	if (tr != NULL)
+	if (tr != NULL) {
 		is->accessing_save_file = this;
+		is->saved_trait_profiles_hash_present = false;
+		is->saved_trait_profiles_hash = 0;
+		is->trait_profiles_save_mismatch_reported = false;
+	}
 	return tr;
 }
 
@@ -32708,6 +35168,15 @@ patch_MappedFile_create_file_to_save_game (MappedFile * this, int edx, LPCSTR fi
 
 	// Assemble mod save data
 	struct buffer mod_data = {0}; {
+		// The external profile files themselves are intentionally not embedded in
+		// the save. This deterministic schema-aware hash lets the loader detect
+		// when an offline save is resumed with different trait effects. Custom
+		// profiles are disabled online, so network saves omit this local-only data.
+		if (! is_online_game ()) {
+			serialize_aligned_text ("civilization_trait_profiles_hash", &mod_data);
+			*(unsigned int *)buffer_allocate (&mod_data, sizeof(unsigned int)) = is->trait_profiles_hash;
+		}
+
 		if (is->extra_defensive_bombards.len > 0) {
 			serialize_aligned_text ("extra_defensive_bombards", &mod_data);
 			itable_serialize (&is->extra_defensive_bombards, &mod_data);
@@ -33111,6 +35580,56 @@ match_save_chunk_name (byte ** cursor, char const * name)
 		return false;
 }
 
+// Bounded variant used for fixed-layout compatibility chunks. Unlike the
+// legacy matcher above, this never calls strcmp or advances through padding
+// until the complete aligned name is known to be inside the save segment.
+bool
+match_save_chunk_name_bounded (byte ** cursor, byte * end, char const * name)
+{
+	if ((cursor == NULL) || (*cursor == NULL) || (end == NULL) || (name == NULL) || (*cursor > end))
+		return false;
+
+	int name_len = strlen (name);
+	int padded_len = (name_len + 4) & ~3;
+	int remaining = end - *cursor;
+	if ((remaining < padded_len) ||
+	    (memcmp (*cursor, name, name_len) != 0) ||
+	    ((*cursor)[name_len] != '\0'))
+		return false;
+
+	for (int n = name_len; n < padded_len; n++)
+		if ((*cursor)[n] != 0)
+			return false;
+
+	*cursor += padded_len;
+	return true;
+}
+
+void
+warn_if_saved_trait_profiles_mismatch (void)
+{
+	if (is_online_game () ||
+	    (! is->saved_trait_profiles_hash_present) ||
+	    is->trait_profiles_save_mismatch_reported ||
+	    (is->saved_trait_profiles_hash == is->trait_profiles_hash))
+		return;
+
+	is->trait_profiles_save_mismatch_reported = true;
+	PopupForm * popup = get_popup_form ();
+	popup->vtable->set_text_key_and_flags (popup, __, is->mod_script_path, "C3X_WARNING", -1, 0, 0, 0);
+
+	char message[240];
+	snprintf (message, sizeof message,
+		  "Civilization trait profile mismatch: this save uses hash %08X, but the currently loaded profile files use %08X.",
+		  is->saved_trait_profiles_hash, is->trait_profiles_hash);
+	message[(sizeof message) - 1] = '\0';
+	PopupForm_add_text (popup, __, message, false);
+	PopupForm_add_text (popup, __,
+			    "Trait configuration is not stored in the save. Continuing with different files can change gameplay; restore the matching files or save under a new name.",
+			    false);
+	patch_show_popup (popup, __, 0, 0);
+}
+
 bool
 match_save_segment_bookend (byte * b)
 {
@@ -33123,6 +35642,11 @@ patch_move_game_data (byte * buffer, bool save_else_load)
 	int tr = move_game_data (buffer, save_else_load);
 
 	if (! save_else_load) {
+		// Old saves have no profile hash chunk. Clear any value retained from the
+		// previous game before looking for the optional C3X save segment.
+		is->saved_trait_profiles_hash_present = false;
+		is->saved_trait_profiles_hash = 0;
+
 		// Free all district_instance structs first
 		FOR_TABLE_ENTRIES (tei, &is->district_tile_map) {
 			struct district_instance * inst = (struct district_instance *)tei.value;
@@ -33157,7 +35681,17 @@ patch_move_game_data (byte * buffer, bool save_else_load)
 		byte * cursor = seg;
 		char * error_chunk_name = NULL;
 		while (cursor < seg + seg_size) {
-			if (match_save_chunk_name (&cursor, "special save message")) {
+			if (match_save_chunk_name_bounded (&cursor, seg + seg_size, "civilization_trait_profiles_hash")) {
+				if ((seg + seg_size) - cursor >= (int)sizeof(unsigned int)) {
+					is->saved_trait_profiles_hash = (unsigned int)int_from_bytes (cursor);
+					is->saved_trait_profiles_hash_present = true;
+					cursor += sizeof(unsigned int);
+				} else {
+					error_chunk_name = "civilization_trait_profiles_hash";
+					break;
+				}
+
+			} else if (match_save_chunk_name (&cursor, "special save message")) {
 				char * msg = (char *)cursor;
 				cursor = (byte *)((int)cursor + strlen (msg) + 4 & ~3);
 
@@ -33926,7 +36460,8 @@ patch_move_game_data (byte * buffer, bool save_else_load)
 			snprintf (s, sizeof s, "Failed to read mod save data. Error occured in chunk: %s", error_chunk_name);
 			s[(sizeof s) - 1] = '\0';
 			pop_up_in_game_error (s);
-		}
+		} else
+			warn_if_saved_trait_profiles_mismatch ();
 
 		free (seg);
 	}
@@ -35159,6 +37694,28 @@ patch_find_nearest_city_for_ai_alliance_eval (int tile_x, int tile_y, int owner_
 	return tr;
 }
 
+int __cdecl
+patch_get_max_move_points (UnitType * unit_type, int civ_id)
+{
+	int original = get_max_move_points (unit_type, civ_id);
+	if ((! trait_profile_effects_are_active ()) ||
+	    (civ_id <= 0) || (civ_id >= 32) ||
+	    (unit_type == NULL) || (unit_type->Unit_Class != UTC_Sea))
+		return original;
+
+	struct trait_profile effects;
+	if (! aggregate_trait_profiles_for_leader (&leaders[civ_id], 0, &effects))
+		return original;
+	int native_bonus =
+		(get_trait_identity_mask_for_leader (&leaders[civ_id]) & RBF_Seafaring) ? 1 : 0;
+	long long result = (long long)original +
+		(long long)(effects.sea_unit_move_bonus - native_bonus) *
+		p_bic_data->General.RoadsMovementRate;
+	if (result < 0)
+		return 0;
+	return result > INT_MAX ? INT_MAX : (int)result;
+}
+
 int __fastcall
 patch_Unit_get_max_move_points (Unit * this)
 {
@@ -35176,7 +37733,7 @@ patch_Unit_get_max_move_points (Unit * this)
 		if (any_units_in_army)
 			return slowest_member_mp + p_bic_data->General.RoadsMovementRate;
 		else
-			return get_max_move_points (&p_bic_data->UnitTypes[this->Body.UnitTypeID], this->Body.CivID);
+			return patch_get_max_move_points (&p_bic_data->UnitTypes[this->Body.UnitTypeID], this->Body.CivID);
 
 	// If the unit is an army and has been set as contained inside itself for a coast walk, the game will crash due to recursive calls computing
 	// the max MP of each member. In that case, temporarily restore its true container.

@@ -21,4 +21,6 @@ user.districts_wonders_config.txt
 **/scenario.districts_wonders_config.txt
 user.districts_natural_wonders_config.txt
 **/scenario.districts_natural_wonders_config.txt
+user.civilization_traits_config.txt
+**/scenario.civilization_traits_config.txt
 AGENTS.md
