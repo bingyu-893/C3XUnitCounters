@@ -2171,6 +2171,20 @@ struct injected_state {
 		Unit * army;
 		Unit * defender;
 	} counter_army_attacker_selection_ctx;
+	// Answers "does unit type T match rule R's attacker side / defender side"
+	// without the per-evaluation strcmp and tag table lookups that
+	// unit_matches_counter_side would otherwise perform. Each unit type owns two
+	// bitsets of words_per_type words indexed by rule number, so the set of rules
+	// that can apply to a matchup is two bitwise ANDs per 32 rules. Rebuilt
+	// lazily whenever the rule list or the unit type list changes.
+	struct counter_rule_match_cache {
+		bool built;
+		int rule_count;
+		int unit_type_count;
+		int words_per_type;
+		unsigned int * attacker_side_bits; // [unit_type_count * words_per_type]
+		unsigned int * defender_side_bits;
+	} counter_match_cache;
 
 	struct combat_odds_hud_state {
 		bool active;
