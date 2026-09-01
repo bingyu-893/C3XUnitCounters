@@ -9,8 +9,8 @@ typedef unsigned char byte;
 #define __fastcall __attribute__((fastcall))
 #include "Civ3Conquests.h"
 
-#define MOD_VERSION 2700
-#define MOD_PREVIEW_VERSION 0
+#define MOD_VERSION 2800
+#define MOD_PREVIEW_VERSION 1
 
 #define COUNT_TILE_HIGHLIGHTS 11
 #define MAX_BUILDING_PREREQS_FOR_UNIT 10
@@ -420,6 +420,7 @@ struct c3x_config {
 	bool allow_bombard_of_other_improvs_on_occupied_airfield;
 	bool show_total_city_count;
 	enum combat_win_rate_display_mode combat_win_rate_display_mode;
+	bool persist_combat_win_rate_display;
 	bool strengthen_forbidden_palace_ocn_effect;
 	int extra_unit_maintenance_per_shields;
 	enum special_zone_of_control_rules special_zone_of_control_rules;
@@ -2196,6 +2197,18 @@ struct injected_state {
 		struct counter_effect_summary counter_effects;
 		char text[64];
 	} combat_odds_hud;
+	bool combat_odds_hud_redrawing;
+	bool combat_odds_hud_hide_pending;
+	LARGE_INTEGER combat_odds_hud_hide_started_at;
+	// Rect the box was last composited into. The Main_GUI canvas is not
+	// cleared under it, so preserve the covered pixels and restore them when
+	// the box moves or disappears. A fill would paint a black hole instead.
+	int combat_odds_hud_drawn_left, combat_odds_hud_drawn_top,
+	    combat_odds_hud_drawn_w, combat_odds_hud_drawn_h;
+	bool combat_odds_hud_rect_drawn;
+	unsigned short * combat_odds_hud_background_pixels;
+	int combat_odds_hud_background_pixel_capacity;
+	JGL_Image * combat_odds_hud_background_canvas;
 	PCX_Image combat_odds_hud_compact_backdrop;
 	enum init_state combat_odds_hud_compact_backdrop_state;
 	PCX_Image combat_odds_hud_detailed_backdrop;
