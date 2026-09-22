@@ -387,6 +387,7 @@ struct c3x_config {
 	bool include_stealth_attack_cancel_option;
 	bool intercept_recon_missions;
 	bool charge_one_move_for_recon_and_interception;
+	struct table recon_radius; // Unit type ID -> square recon radius; absent entries use the stock area.
 	int steal_plans_duration;
 	bool polish_precision_striking;
 	bool enable_stealth_attack_via_bombardment;
@@ -426,6 +427,12 @@ struct c3x_config {
 	bool dont_end_units_turn_after_bombarding_barricade;
 	bool remove_land_artillery_target_restrictions;
 	bool allow_bombard_of_other_improvs_on_occupied_airfield;
+	bool use_citizen_bombard_defense_by_era;
+	int citizen_bombard_defense_by_era[4];
+	bool use_building_bombard_defense_by_era;
+	int building_bombard_defense_by_era[4];
+	bool use_tile_bombard_defense_by_era;
+	int tile_bombard_defense_by_era[4];
 	bool show_total_city_count;
 	enum combat_win_rate_display_mode combat_win_rate_display_mode;
 	bool persist_combat_win_rate_display;
@@ -454,7 +461,9 @@ struct c3x_config {
 	bool convert_to_landmark_after_planting_forest;
 	int chance_for_nukes_to_destroy_max_one_hp_units;
 	bool allow_sale_of_aqueducts_and_hospitals;
+	bool remove_fresh_water_growth_bonus;
 	bool no_cross_shore_detection;
+	bool limit_detection_by_units_to_adjacent_tiles;
 	int radar_tower_detection_distance;
 	int outpost_detection_distance;
 	int city_work_radius;

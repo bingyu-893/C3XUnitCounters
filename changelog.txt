@@ -2,9 +2,14 @@
   - Main option combat_win_rate_display_mode can be set to off, compact, or detailed. Detailed mode includes combat counter factors.
   - Related option persist_combat_win_rate_display controls whether the background box is hidden when empty
 - Include any resource and bonus shield in yields from tiles with improvement-type districts
+- Set of options to vary, by era, the defensive strengths of population, city improvements, and tile improvements against bombardment
+  - Named citizen_bombard_defense_by_era, building_bombard_defense_by_era, and tile_bombard_defense_by_era
 - Option city_center_food_yield to control how much food city center tiles produce
   - Can be set to one citizen's worth of food (standard rules), to include food from tile resources, or to match the yield from the underlying tile
-- Allow unit type tags to be set by Civilopedia key or on all units with a given AI strategy or unit  ability
+- Make the size of the area revealed by recon missions adjustable per unit type, option named recon_radius
+- Allow unit type tags to be set by Civilopedia key or on all units with a given AI strategy or unit ability
+- Option remove_fresh_water_growth_bonus that makes all cities require aqueducts to grow to size level two, including those founded next to a river or lake
+- Option limit_detection_by_units_to_adjacent_tiles to restrict units' detect invisible ability to adjacent tiles
 - Fix city governors unable to assign workers to improvement-type districts after construction
 - Fix can_bombard_only_sea_tiles not applying to AI units or aerial defensive bombard
 - Fix some ways areas revealed by recon can stay permanently revealed

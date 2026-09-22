@@ -813,6 +813,8 @@ reset_to_base_config ()
 		cc->count_counter_rules = 0;
 	}
 
+	table_deinit (&cc->recon_radius);
+
 	// Free unit limits table
 	FOR_TABLE_ENTRIES (tei, &cc->unit_limits)
 		free ((void *)tei.value);
@@ -1513,6 +1515,31 @@ parse_unit_type_limit (char ** p_cursor, struct error_line ** p_unrecognized_lin
 
 	} else
 		return RPR_PARSE_ERROR;
+}
+
+struct parsed_recon_radius {
+	int unit_type_id;
+	struct unit_type_tag * tag;
+	int radius;
+};
+
+enum recognizable_parse_result
+parse_recon_radius (char ** p_cursor, struct error_line ** p_unrecognized_lines, void * out_radius)
+{
+	char * cur = *p_cursor;
+	struct parsed_recon_radius * out = out_radius;
+	struct string_slice name;
+	if (! (parse_string (&cur, &name) && skip_punctuation (&cur, ':') &&
+	       parse_int (&cur, &out->radius)) || (out->radius < 0))
+		return RPR_PARSE_ERROR;
+	*p_cursor = cur;
+	out->unit_type_id = -1;
+	out->tag = NULL;
+	if (find_unit_type_id_by_name (&name, 0, &out->unit_type_id) ||
+	    stable_look_up_slice (&is->current_config.unit_type_tags, &name, (int *)&out->tag))
+		return RPR_OK;
+	add_unrecognized_line (p_unrecognized_lines, &name);
+	return RPR_UNRECOGNIZED;
 }
 
 struct unit_type_tag_member {
@@ -2942,6 +2969,38 @@ read_units_per_tile_limit (struct string_slice const * s, int * out_limits)
 	}
 }
 
+bool
+read_bombard_defense_by_era (struct string_slice const * s, bool * out_enabled, int * out_values)
+{
+	char * text = extract_slice (s);
+	char * cursor = text;
+	int values[4];
+	bool valid = true;
+	skip_white_space (&cursor);
+	bool enabled = *cursor != '\0';
+	if (enabled) {
+		for (int n = 0; n < ARRAY_LEN (values); n++) {
+			skip_white_space (&cursor);
+			if (! ((*cursor == '-') || ((*cursor >= '0') && (*cursor <= '9'))) ||
+			    ! parse_int (&cursor, &values[n])) {
+				valid = false;
+				break;
+			}
+			skip_white_space (&cursor);
+			if ((n < ARRAY_LEN (values) - 1) && (*cursor == ','))
+				cursor++;
+		}
+		valid = valid && (*cursor == '\0');
+	}
+	if (valid) {
+		*out_enabled = enabled;
+		if (enabled)
+			memcpy (out_values, values, sizeof values);
+	}
+	free (text);
+	return valid;
+}
+
 struct config_parsing {
 	char * file_path;
 	char * text;
@@ -3300,6 +3359,18 @@ load_config (char const * file_path, int path_is_relative_to_mod_dir)
 				} else if (slice_matches_str (&p.key, "limit_defensive_retreat_on_water_to_types")) {
 					if (! read_unit_type_list (&value, &unrecognized_lines, &cfg->limit_defensive_retreat_on_water_to_types))
 						handle_config_error (&p, CPE_BAD_VALUE);
+				} else if (slice_matches_str (&p.key, "citizen_bombard_defense_by_era")) {
+					if ((value.str <= p.text) || (value.str[-1] != '[') ||
+					    ! read_bombard_defense_by_era (&value, &cfg->use_citizen_bombard_defense_by_era, cfg->citizen_bombard_defense_by_era))
+						handle_config_error (&p, CPE_BAD_VALUE);
+				} else if (slice_matches_str (&p.key, "building_bombard_defense_by_era")) {
+					if ((value.str <= p.text) || (value.str[-1] != '[') ||
+					    ! read_bombard_defense_by_era (&value, &cfg->use_building_bombard_defense_by_era, cfg->building_bombard_defense_by_era))
+						handle_config_error (&p, CPE_BAD_VALUE);
+				} else if (slice_matches_str (&p.key, "tile_bombard_defense_by_era")) {
+					if ((value.str <= p.text) || (value.str[-1] != '[') ||
+					    ! read_bombard_defense_by_era (&value, &cfg->use_tile_bombard_defense_by_era, cfg->tile_bombard_defense_by_era))
+						handle_config_error (&p, CPE_BAD_VALUE);
 				} else if (slice_matches_str (&p.key, "ptw_like_artillery_targeting")) {
 					if (! read_unit_type_list (&value, &unrecognized_lines, &cfg->ptw_arty_types))
 						handle_config_error (&p, CPE_BAD_VALUE);
@@ -3322,6 +3393,24 @@ load_config (char const * file_path, int path_is_relative_to_mod_dir)
 											 (void **)&cfg->leader_era_alias_lists,
 											 &cfg->count_leader_era_alias_lists)))
 						handle_config_error_at (&p, value.str + recog_err_offset, CPE_BAD_VALUE);
+				} else if (slice_matches_str (&p.key, "recon_radius")) {
+					struct parsed_recon_radius * entries = NULL;
+					int count = 0;
+					if (0 <= (recog_err_offset = read_recognizables (&value, &unrecognized_lines,
+							sizeof *entries, parse_recon_radius, (void **)&entries, &count)))
+						handle_config_error_at (&p, value.str + recog_err_offset, CPE_BAD_VALUE);
+					for (int n = 0; n < count; n++) {
+						struct parsed_recon_radius * entry = &entries[n];
+						if (entry->unit_type_id >= 0) {
+							char * name = p_bic_data->UnitTypes[entry->unit_type_id].Name;
+							for (int id = entry->unit_type_id; id < p_bic_data->UnitTypeCount; id++)
+								if (strcmp (name, p_bic_data->UnitTypes[id].Name) == 0)
+									itable_insert (&cfg->recon_radius, id, entry->radius);
+						} else
+							for (int i = 0; i < entry->tag->count_unit_type_ids; i++)
+								itable_insert (&cfg->recon_radius, entry->tag->unit_type_ids[i], entry->radius);
+					}
+					free (entries);
 				} else if (slice_matches_str (&p.key, "unit_limits")) {
 					struct parsed_unit_type_limit * parsed_unit_type_limits = NULL;
 					int parsed_unit_type_limit_count = 0;
@@ -18388,6 +18477,10 @@ apply_machine_code_edits (struct c3x_config const * cfg, bool at_program_start)
 			int_to_bytes (ADDR_TRADABLE_UNITS_SIZE_TO_CLEAR, tradable_units_size);
 	}
 
+	// Disable the freshwater bypass in City_requires_improvement_to_grow. Keeping the rest of the original check preserves
+	// active aqueducts, modded population limits, and the hospital requirement for all growth and join-city callers.
+	set_nopification (cfg->remove_fresh_water_growth_bonus, ADDR_FRESH_WATER_GROWTH_BYPASS, 2);
+
 	// Remove the standard rule that blocks battle-created units while the player already has one
 	set_nopification (cfg->allow_multiple_battle_created_units_per_player, ADDR_EXISTING_BATTLE_CREATED_UNIT_CHECK, 6);
 
@@ -18905,7 +18998,8 @@ apply_machine_code_edits (struct c3x_config const * cfg, bool at_program_start)
 		*ADDR_UNIT_TO_UNIT_VISIBILITY_RADIUS = (byte)(max_tile_iter);
 	}
 	WITH_MEM_PROTECTION (ADDR_CIV_UNIT_VISIBILITY_RADIUS, 1, PAGE_EXECUTE_READWRITE) {
-		*ADDR_CIV_UNIT_VISIBILITY_RADIUS = (byte)(max_tile_iter_2);
+		// This is the detector scan in Unit::is_visible_to_civ. The adjacency limit takes precedence over expanded visibility.
+		*ADDR_CIV_UNIT_VISIBILITY_RADIUS = cfg->limit_detection_by_units_to_adjacent_tiles ? 9 : (byte)(max_tile_iter_2);
 	}
 
 	WITH_MEM_PROTECTION (ADDR_UTC_SEA_CMP_1, 8, PAGE_EXECUTE_READWRITE) {
@@ -20178,7 +20272,9 @@ patch_init_floating_point ()
 		{"exclude_passengers_from_stealth_attack"                , false, offsetof (struct c3x_config, exclude_passengers_from_stealth_attack)},
 		{"convert_to_landmark_after_planting_forest"             , false, offsetof (struct c3x_config, convert_to_landmark_after_planting_forest)},
 		{"allow_sale_of_aqueducts_and_hospitals"                 , false, offsetof (struct c3x_config, allow_sale_of_aqueducts_and_hospitals)},
+		{"remove_fresh_water_growth_bonus"                       , false, offsetof (struct c3x_config, remove_fresh_water_growth_bonus)},
 		{"no_cross_shore_detection"                              , false, offsetof (struct c3x_config, no_cross_shore_detection)},
+		{"limit_detection_by_units_to_adjacent_tiles"            , false, offsetof (struct c3x_config, limit_detection_by_units_to_adjacent_tiles)},
 		{"limit_unit_loading_to_one_transport_per_turn"          , false, offsetof (struct c3x_config, limit_unit_loading_to_one_transport_per_turn)},
 		{"prevent_old_units_from_upgrading_past_ability_block"   , false, offsetof (struct c3x_config, prevent_old_units_from_upgrading_past_ability_block)},
 		{"allow_extraterritorial_colonies"                       , false, offsetof (struct c3x_config, allow_extraterritorial_colonies)},
@@ -25528,11 +25624,15 @@ patch_Map_impl_is_near_lake_within_work_area (Map * this, int edx, int x, int y,
 bool __fastcall
 patch_Map_impl_has_fresh_water_within_work_area (Map * this, int edx, int tile_x, int tile_y)
 {
+	// This call in City_can_build_improvement only checks whether freshwater makes a size-level-2 building redundant.
+	if (is->current_config.remove_fresh_water_growth_bonus)
+		return false;
+
 	if (is->current_config.enable_districts && is->current_config.expand_water_tile_checks_to_city_work_area) {
 		int improv_id = is->current_evaluating_improve_id;
 		if ((improv_id >= 0) && (improv_id < p_bic_data->ImprovementsCount)) {
 
-			// If an Aqueduct, default to original logic (city must be next to coast)
+			// If an Aqueduct, check freshwater adjacent to the city itself
 			if ((p_bic_data->Improvements[improv_id].ImprovementFlags & ITF_Allows_City_Level_2) != 0)
 				return this->vtable->has_fresh_water (this, __, tile_x, tile_y);
 		}
@@ -28348,6 +28448,50 @@ patch_Fighter_begin (Fighter * this, int edx, Unit * attacker, int attack_direct
 	}
 }
 
+// Enumerate a square in tile axes, which are diagonal in Civ's doubled-X map coordinates.
+void
+update_recon_area (Unit * unit, int center_x, int center_y, int radius, bool reveal)
+{
+	Map * map = &p_bic_data->Map;
+	if ((center_x < 0) || (center_y < 0) || (center_x >= map->Width) || (center_y >= map->Height))
+		return;
+	// Larger radii cannot add tiles beyond the whole map. Bound the loop even for very large config values.
+	radius = clamp (0, not_below (map->Width, map->Height), radius);
+	for (int a = -radius; a <= radius; a++)
+		for (int b = -radius; b <= radius; b++) {
+			int x = center_x + a + b, y = center_y + b - a;
+			wrap_tile_coords (map, &x, &y);
+			if ((x < 0) || (y < 0) || (x >= map->Width) || (y >= map->Height))
+				continue;
+			if (reveal)
+				Leader_reveal_tile_by_air_recon (&leaders[unit->Body.CivID], __, x, y);
+			else {
+				// Preserve the base game's exception for friendly recon units physically occupying a tile.
+				bool keep_visible = false;
+				FOR_UNITS_ON (uti, tile_at (x, y))
+					if ((uti.unit->Body.CivID == unit->Body.CivID) &&
+					    (uti.unit->Body.Status & USF_PERFORMED_AIR_RECON)) {
+						keep_visible = true;
+						break;
+					}
+				if (! keep_visible)
+					Leader_clear_tile_air_recon (&leaders[unit->Body.CivID], __, x, y);
+			}
+		}
+}
+
+void
+clear_current_recon_target (Unit * unit)
+{
+	int radius;
+	if (itable_look_up (&is->current_config.recon_radius, unit->Body.UnitTypeID, &radius)) {
+		unit->Body.Status &= ~USF_PERFORMED_AIR_RECON;
+		update_recon_area (unit, unit->Body.recon_target_x, unit->Body.recon_target_y, radius, false);
+		unit->Body.recon_target_x = unit->Body.recon_target_y = -1;
+	} else
+		Unit_clear_air_recon_visibility (unit);
+}
+
 // Entries are contiguous from mission index zero. Always discard them on despawn, even when visibility cleanup is disabled.
 void
 remove_extra_recon_targets (Unit * unit, bool clear_visibility)
@@ -28361,7 +28505,7 @@ remove_extra_recon_targets (Unit * unit, bool clear_visibility)
 		itable_remove (&is->extra_recon_targets, key);
 		if (clear_visibility) {
 			tile_index_to_coords (&p_bic_data->Map, tile_index, &unit->Body.recon_target_x, &unit->Body.recon_target_y);
-			Unit_clear_air_recon_visibility (unit);
+			clear_current_recon_target (unit);
 		}
 	}
 }
@@ -28370,7 +28514,7 @@ void __fastcall
 patch_Unit_clear_air_recon_visibility (Unit * this)
 {
 	// Clear the native target first, including targets loaded from saves without the extra table.
-	Unit_clear_air_recon_visibility (this);
+	clear_current_recon_target (this);
 	remove_extra_recon_targets (this, true);
 }
 
@@ -30179,7 +30323,15 @@ patch_Unit_perform_air_recon (Unit * this, int edx, int x, int y)
 	if (! was_intercepted) {
 		if (mission_index < 256)
 			itable_insert (&is->extra_recon_targets, (int)(((unsigned)this->Body.ID << 8) | mission_index), previous_target);
-		Unit_perform_air_recon (this, __, x, y);
+		int radius;
+		if (itable_look_up (&is->current_config.recon_radius, this->Body.UnitTypeID, &radius)) {
+			this->Body.Status |= USF_PERFORMED_AIR_RECON;
+			this->Body.recon_target_x = x;
+			this->Body.recon_target_y = y;
+			update_recon_area (this, x, y, radius, true);
+			this->Body.Moves = patch_Unit_get_max_move_points (this);
+		} else
+			Unit_perform_air_recon (this, __, x, y);
 		if (is->current_config.charge_one_move_for_recon_and_interception)
 			this->Body.Moves = moves_plus_one;
 	}
@@ -30963,6 +31115,93 @@ patch_deinitialize_map_music ()
 		deinitialize_map_music ();
 }
 
+int
+get_tile_bombard_defense_by_era (int x, int y)
+{
+	if (! is->current_config.use_tile_bombard_defense_by_era)
+		return 16;
+	Tile * tile = tile_at (x, y);
+	if ((tile == NULL) || (tile == p_null_tile))
+		return 16;
+	int owner = tile->vtable->m38_Get_Territory_OwnerID (tile);
+	if ((owner <= 0) || (owner >= 32))
+		owner = tile->vtable->m70_Get_Tile_Building_OwnerID (tile);
+	if ((owner > 0) && (owner < 32)) {
+		int era = leaders[owner].Era;
+		if ((era >= 0) && (era < ARRAY_LEN (is->current_config.tile_bombard_defense_by_era)))
+			return is->current_config.tile_bombard_defense_by_era[era];
+	}
+	return 16;
+}
+
+int
+get_tile_bombard_defense_threshold (Unit * unit, int x, int y, int base_defense)
+{
+	int terrain_bonus = get_defense_bonus_between_tiles (-1, -1, x, y);
+	int building_bonus = patch_get_building_defense_bonus_at (x, y, -1);
+	long long defense = (long long)base_defense * (100LL + terrain_bonus + building_bonus) / 100;
+	// Keep the game's integer rounding and 1..1023 threshold, using wider intermediates for configured strengths.
+	if (defense <= 0)
+		return 1;
+	long long total = defense + p_bic_data->UnitTypes[unit->Body.UnitTypeID].Bombard_Strength;
+	return (total > 0) ? clamp (1, 1023, (int)(1024 * defense / total)) : 1023;
+}
+
+bool __fastcall
+patch_Fighter_roll_for_bombard (Fighter * this, int edx, Unit * unit, int x, int y)
+{
+	int base_defense = get_tile_bombard_defense_by_era (x, y);
+	if (base_defense == 16)
+		return Fighter_roll_for_bombard (this, __, unit, x, y);
+	if ((unit == NULL) || (p_bic_data->UnitTypes[unit->Body.UnitTypeID].Bombard_Strength == 0))
+		return false;
+	int threshold = get_tile_bombard_defense_threshold (unit, x, y, base_defense);
+	for (int n = 0; n < p_bic_data->UnitTypes[unit->Body.UnitTypeID].FireRate; n++)
+		if ((rand_int (p_rand_object, __, 1024) & 0xffff) >= threshold)
+			return true;
+	return false;
+}
+
+bool __fastcall
+patch_Fighter_cause_collateral_damage (Fighter * this, int edx, Unit * attacker, Unit * defender)
+{
+	int x = defender->Body.X, y = defender->Body.Y;
+	int base_defense = get_tile_bombard_defense_by_era (x, y);
+	// City collateral damage still goes through the existing building-defense hook.
+	if ((base_defense == 16) || (city_at (x, y) != NULL))
+		return Fighter_cause_collateral_damage (this, __, attacker, defender);
+	if (! patch_Unit_can_pillage (attacker, __, x, y))
+		return false;
+	int threshold = get_tile_bombard_defense_threshold (attacker, x, y, base_defense);
+	// Collateral damage gets one roll, irrespective of rate of fire. The destruction routine must not roll again.
+	if ((rand_int (p_rand_object, __, 1024) & 0xffff) < threshold)
+		return false;
+	Unit_destroy_tile_improvements (attacker, __, false, x, y, attacker->Body.CivID);
+	return true;
+}
+
+bool __fastcall
+patch_Fighter_damage_city_by_bombardment (Fighter * this, int edx, Unit * unit, City * city, int damage_kind, int min_fire_rate)
+{
+	int saved_citizen_bonus = p_bic_data->General.DefenceBonus_Citizen;
+	int saved_building_bonus = p_bic_data->General.DefenceBonus_Building;
+	if ((damage_kind == 0) && is->current_config.use_citizen_bombard_defense_by_era) {
+		int era = leaders[city->Body.CivID].Era;
+		if ((era >= 0) && (era < ARRAY_LEN (is->current_config.citizen_bombard_defense_by_era)))
+			p_bic_data->General.DefenceBonus_Citizen = is->current_config.citizen_bombard_defense_by_era[era];
+	}
+	if ((damage_kind == 1) && is->current_config.use_building_bombard_defense_by_era) {
+		int era = leaders[city->Body.CivID].Era;
+		if ((era >= 0) && (era < ARRAY_LEN (is->current_config.building_bombard_defense_by_era)))
+			p_bic_data->General.DefenceBonus_Building = is->current_config.building_bombard_defense_by_era[era];
+	}
+	// Preserve the game's terrain bonuses, rate of fire, population floor, and damage handling.
+	bool result = Fighter_damage_city_by_bombardment (this, __, unit, city, damage_kind, min_fire_rate);
+	p_bic_data->General.DefenceBonus_Citizen = saved_citizen_bonus;
+	p_bic_data->General.DefenceBonus_Building = saved_building_bonus;
+	return result;
+}
+
 void __fastcall
 patch_Fighter_do_bombard_tile (Fighter * this, int edx, Unit * unit, int neighbor_index, int mp_tile_x, int mp_tile_y)
 {
@@ -30987,7 +31226,7 @@ patch_Fighter_do_bombard_tile (Fighter * this, int edx, Unit * unit, int neighbo
 
 		int rv;
 		if ((city != NULL) && ((rv = rand_int (p_rand_object, __, 3)) < 2))
-			Fighter_damage_city_by_bombardment (this, __, unit, city, rv, 0);
+			patch_Fighter_damage_city_by_bombardment (this, __, unit, city, rv, 0);
 		else
 			Fighter_do_bombard_tile (this, __, unit, neighbor_index, mp_tile_x, mp_tile_y);
 
