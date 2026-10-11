@@ -2,6 +2,7 @@
 #include "stdio.h"
 
 #include "C3X.h"
+#include "counter_math.h"
 
 void (WINAPI ** p_OutputDebugStringA) (char * lpOutputString) = ADDR_ADDR_OUTPUTDEBUGSTRINGA;
 short (WINAPI ** p_GetAsyncKeyState) (int vKey) = ADDR_ADDR_GETASYNCKEYSTATE;
@@ -711,8 +712,18 @@ patch_Map_get_tile_for_work_area_drawing (Map * this, int edx, int index)
 
 // Resets is->current_config to the base config and updates the list of config names. Does NOT re-apply machine code edits.
 void
+free_counter_rule_match_cache ()
+{
+	free (is->counter_match_cache.attacker_side_bits);
+	free (is->counter_match_cache.defender_side_bits);
+	is->counter_match_cache = (struct counter_rule_match_cache) {0};
+}
+
+void
 reset_to_base_config ()
 {
+	// Also invalidate same-sized rule/tag replacements and scenario unit names.
+	free_counter_rule_match_cache ();
 	struct c3x_config * cc = &is->current_config;
 
 	for (int n = 0; n < ARRAY_LEN (cc->limit_units_per_tile); n++)
@@ -9087,6 +9098,15 @@ counter_rule_experience_conditions_match (struct counter_rule * r,
 	                                             enemy_experience_id);
 }
 
+bool
+parse_counter_percent (char ** cursor, int * value)
+{
+	// Keep existing integer-percent syntax, but reject negative values before
+	// they can enter a rule. Oversized positive integers are safely saturated
+	// by the existing parser and by counter_multiply_percent.
+	return parse_int (cursor, value) && *value >= 0;
+}
+
 enum recognizable_parse_result
 parse_counter_rule (char ** p_cursor,
                     struct error_line ** p_unrecognized_lines,
@@ -9164,22 +9184,22 @@ parse_counter_rule (char ** p_cursor,
 		} else if (is_counter_rule_ignore_defensive_bonuses_token (&token)) {
 			r->ignore_defensive_bonuses = true;
 		} else if (slice_matches_str (&token, "self-atk")) {
-			if (! parse_int (&cur, &r->self_atk_pct))
+			if (! parse_counter_percent (&cur, &r->self_atk_pct))
 				return RPR_PARSE_ERROR;
 		} else if (slice_matches_str (&token, "self-def")) {
-			if (! parse_int (&cur, &r->self_def_pct))
+			if (! parse_counter_percent (&cur, &r->self_def_pct))
 				return RPR_PARSE_ERROR;
 		} else if (slice_matches_str (&token, "enemy-atk")) {
-			if (! parse_int (&cur, &r->enemy_atk_pct))
+			if (! parse_counter_percent (&cur, &r->enemy_atk_pct))
 				return RPR_PARSE_ERROR;
 		} else if (slice_matches_str (&token, "enemy-def")) {
-			if (! parse_int (&cur, &r->enemy_def_pct))
+			if (! parse_counter_percent (&cur, &r->enemy_def_pct))
 				return RPR_PARSE_ERROR;
 		} else if (slice_matches_str (&token, "self-bombard")) {
-			if (! parse_int (&cur, &r->self_bombard_pct))
+			if (! parse_counter_percent (&cur, &r->self_bombard_pct))
 				return RPR_PARSE_ERROR;
 		} else if (slice_matches_str (&token, "enemy-bombard")) {
-			if (! parse_int (&cur, &r->enemy_bombard_pct))
+			if (! parse_counter_percent (&cur, &r->enemy_bombard_pct))
 				return RPR_PARSE_ERROR;
 		} else if (is_counter_rule_self_experience_token (&token)) {
 			enum recognizable_parse_result res =
@@ -9224,18 +9244,52 @@ parse_counter_rule (char ** p_cursor,
 	return RPR_OK;
 }
 
-bool
-counter_rule_environment_matches (struct c3x_config * cfg,
-                                  struct counter_rule * r,
-                                  Tile * target_tile)
+struct counter_tile_env {
+	Tile * tile;
+	bool city_built, has_city, terrain_built;
+	unsigned int square_type_bits;
+};
+
+unsigned int
+counter_tile_env_square_type_bits (struct counter_tile_env * env)
 {
+	if (! env->terrain_built) {
+		Tile * tile = env->tile;
+		env->square_type_bits = square_type_mask_bit (tile->vtable->m50_Get_Square_BaseType (tile));
+		enum SquareTypes const special[] = {SQ_RIVER, SQ_SNOW_MOUNTAIN, SQ_SNOW_VOLCANO, SQ_SNOW_FOREST};
+		for (int i = 0; i < ARRAY_LEN (special); i++)
+			if (tile_matches_square_type (tile, special[i]))
+				env->square_type_bits |= square_type_mask_bit (special[i]);
+		if (tile->vtable->m18_Check_Mines (tile, __, 0))
+			env->square_type_bits |= district_buildable_mine_mask_bit ();
+		if (tile->vtable->m17_Check_Irrigation (tile, __, 0))
+			env->square_type_bits |= district_buildable_irrigation_mask_bit ();
+		if (tile_is_lake (tile))
+			env->square_type_bits |= district_buildable_lake_mask_bit ();
+		env->terrain_built = true;
+	}
+	return env->square_type_bits;
+}
+
+bool
+counter_rule_environment_matches_env (struct c3x_config * cfg,
+                                      struct counter_rule * r,
+                                      struct counter_tile_env * env)
+{
+	Tile * target_tile = env->tile;
 	if ((target_tile == NULL) || (target_tile == p_null_tile))
 		return false;
 
-	if (r->only_in_city && ! Tile_has_city (target_tile))
-		return false;
+	if (r->only_in_city) {
+		if (! env->city_built) {
+			env->has_city = Tile_has_city (target_tile);
+			env->city_built = true;
+		}
+		if (! env->has_city)
+			return false;
+	}
 	if (r->terrain_mask != 0 &&
-	    ! tile_matches_square_type_mask (target_tile, r->terrain_mask))
+	    ! (counter_tile_env_square_type_bits (env) & r->terrain_mask))
 		return false;
 	if (r->district_name != NULL &&
 	    ! ((r->district_id != -1) &&
@@ -9246,13 +9300,77 @@ counter_rule_environment_matches (struct c3x_config * cfg,
 	return true;
 }
 
+bool
+counter_rule_environment_matches (struct c3x_config * cfg, struct counter_rule * r, Tile * tile)
+{
+	struct counter_tile_env env = {tile};
+	return counter_rule_environment_matches_env (cfg, r, &env);
+}
+
+void
+rebuild_counter_rule_match_cache (struct c3x_config * cfg)
+{
+	free_counter_rule_match_cache ();
+	struct counter_rule_match_cache * c = &is->counter_match_cache;
+	c->rule_count = cfg->count_counter_rules;
+	c->unit_type_count = p_bic_data->UnitTypeCount;
+	c->words = (c->rule_count + 31) / 32;
+	unsigned long long entries = (unsigned long long)c->words * c->unit_type_count;
+	if (! entries || entries > 0x3FFFFFFF)
+		return;
+	c->attacker_side_bits = calloc ((size_t)entries, sizeof (unsigned int));
+	c->defender_side_bits = calloc ((size_t)entries, sizeof (unsigned int));
+	if (! c->attacker_side_bits || ! c->defender_side_bits) {
+		free_counter_rule_match_cache ();
+		return;
+	}
+	for (int type = 0; type < c->unit_type_count; type++)
+		for (int i = 0; i < c->rule_count; i++) {
+			struct counter_rule * r = &cfg->counter_rules[i];
+			int word = type * c->words + i / 32;
+			unsigned int bit = 1U << (i % 32);
+			if (unit_matches_counter_side (cfg, type, r->attacker_match, r->attacker_tag_id))
+				c->attacker_side_bits[word] |= bit;
+			if (unit_matches_counter_side (cfg, type, r->defender_match, r->defender_tag_id))
+				c->defender_side_bits[word] |= bit;
+		}
+	c->built = true;
+}
+
+struct counter_rule_match_cache *
+get_counter_rule_match_cache (struct c3x_config * cfg)
+{
+	struct counter_rule_match_cache * c = &is->counter_match_cache;
+	if (! c->built || c->rule_count != cfg->count_counter_rules ||
+	    c->unit_type_count != p_bic_data->UnitTypeCount)
+		rebuild_counter_rule_match_cache (cfg);
+	return c;
+}
+
+void
+format_counter_percent (char * dest, int capacity, long long multiplier)
+{
+	long long hundredths = (multiplier + COUNTER_SCALE / 20000) / (COUNTER_SCALE / 10000);
+	int whole = hundredths / 100, fraction = hundredths % 100;
+	if (! fraction) snprintf (dest, capacity, "%d", whole);
+	else if (fraction % 10 == 0) snprintf (dest, capacity, "%d.%d", whole, fraction / 10);
+	else snprintf (dest, capacity, "%d.%02d", whole, fraction);
+}
+
 void
 init_neutral_counter_effect_summary (struct counter_effect_summary * out)
 {
-	out->attacker_atk_pct = 100;
-	out->defender_def_pct = 100;
-	out->bombard_pct = 100;
+	out->attacker_atk_pct = COUNTER_SCALE;
+	out->defender_def_pct = COUNTER_SCALE;
+	out->bombard_pct = COUNTER_SCALE;
 	out->ignore_defensive_bonuses = false;
+}
+
+bool
+counter_effects_change_combat (struct counter_effect_summary * effects)
+{
+	return effects->attacker_atk_pct != COUNTER_SCALE ||
+	       effects->defender_def_pct != COUNTER_SCALE || effects->ignore_defensive_bonuses;
 }
 
 void
@@ -9262,7 +9380,7 @@ get_counter_effect_summary (struct c3x_config * cfg,
                             struct counter_effect_summary * out)
 {
 	init_neutral_counter_effect_summary (out);
-	if (! (cfg->enable_unit_counters &&
+	if (! (cfg->enable_unit_counters && (cfg->count_counter_rules > 0) &&
 	       (attacker != NULL) &&
 	       (defender != NULL) &&
 	       (attacker->Body.UnitTypeID >= 0) &&
@@ -9274,58 +9392,67 @@ get_counter_effect_summary (struct c3x_config * cfg,
 	int a_type = attacker->Body.UnitTypeID;
 	int d_type = defender->Body.UnitTypeID;
 
-	for (int i = 0; i < cfg->count_counter_rules; i++) {
-		struct counter_rule * r = &cfg->counter_rules[i];
+	struct counter_rule_match_cache * cache = get_counter_rule_match_cache (cfg);
+	if (! cache->built)
+		return;
+	struct counter_tile_env env = {def_tile};
+	unsigned int * aa = cache->attacker_side_bits + a_type * cache->words;
+	unsigned int * ad = cache->defender_side_bits + a_type * cache->words;
+	unsigned int * da = cache->attacker_side_bits + d_type * cache->words;
+	unsigned int * dd = cache->defender_side_bits + d_type * cache->words;
+	for (int word = 0; word < cache->words; word++) {
+		unsigned int forward_bits = aa[word] & dd[word];
+		unsigned int reverse_bits = ad[word] & da[word];
+		unsigned int hits = forward_bits | reverse_bits;
+		// Ascending words, then least significant hit first: rule order is stable.
+		while (hits) {
+			unsigned int bit = hits & (0U - hits);
+			int index = 0;
+			for (unsigned int shifted = bit; shifted > 1; shifted >>= 1)
+				index++;
+			hits &= hits - 1;
+			struct counter_rule * r = &cfg->counter_rules[word * 32 + index];
+			bool forward = (forward_bits & bit) != 0;
+			bool reverse = (reverse_bits & bit) != 0;
 
-		// Check forward match (attacker=rule attacker side, defender=rule defender side).
-		bool forward = unit_matches_counter_side (cfg, a_type,
-		                   r->attacker_match, r->attacker_tag_id) &&
-		               unit_matches_counter_side (cfg, d_type,
-		                   r->defender_match, r->defender_tag_id);
+			if (forward &&
+			    ! counter_rule_experience_conditions_match (
+			        r,
+			        attacker->Body.Combat_Experience,
+			        defender->Body.Combat_Experience))
+				forward = false;
 
-		// Check reverse match (attacker=rule defender side, defender=rule attacker side).
-		bool reverse = unit_matches_counter_side (cfg, a_type,
-		                   r->defender_match, r->defender_tag_id) &&
-		               unit_matches_counter_side (cfg, d_type,
-		                   r->attacker_match, r->attacker_tag_id);
+			if (reverse &&
+			    ! counter_rule_experience_conditions_match (
+			        r,
+			        defender->Body.Combat_Experience,
+			        attacker->Body.Combat_Experience))
+				reverse = false;
 
-		if (forward &&
-		    ! counter_rule_experience_conditions_match (
-		        r,
-		        attacker->Body.Combat_Experience,
-		        defender->Body.Combat_Experience))
-			forward = false;
+			if ((! forward && ! reverse) ||
+			    ! counter_rule_environment_matches_env (cfg, r, &env))
+				continue;
 
-		if (reverse &&
-		    ! counter_rule_experience_conditions_match (
-		        r,
-		        defender->Body.Combat_Experience,
-		        attacker->Body.Combat_Experience))
-			reverse = false;
-
-		if ((! forward && ! reverse) ||
-		    ! counter_rule_environment_matches (cfg, r, def_tile))
-			continue;
-
-		if (forward) {
-			out->attacker_atk_pct =
-				out->attacker_atk_pct * r->self_atk_pct / 100;
-			out->bombard_pct =
-				out->bombard_pct * r->self_bombard_pct / 100;
-			if (r->ignore_defensive_bonuses) {
-				// ignore-defensive-bonuses replaces this rule's enemy-def effect.
-				out->ignore_defensive_bonuses = true;
-			} else
+			if (forward) {
+				out->attacker_atk_pct =
+					counter_multiply_percent (out->attacker_atk_pct, r->self_atk_pct);
+				out->bombard_pct =
+					counter_multiply_percent (out->bombard_pct, r->self_bombard_pct);
+				if (r->ignore_defensive_bonuses) {
+					// ignore-defensive-bonuses replaces this rule's enemy-def effect.
+					out->ignore_defensive_bonuses = true;
+				} else
+					out->defender_def_pct =
+						counter_multiply_percent (out->defender_def_pct, r->enemy_def_pct);
+			}
+			if (reverse) {
+				out->attacker_atk_pct =
+					counter_multiply_percent (out->attacker_atk_pct, r->enemy_atk_pct);
 				out->defender_def_pct =
-					out->defender_def_pct * r->enemy_def_pct / 100;
-		}
-		if (reverse) {
-			out->attacker_atk_pct =
-				out->attacker_atk_pct * r->enemy_atk_pct / 100;
-			out->defender_def_pct =
-				out->defender_def_pct * r->self_def_pct / 100;
-			out->bombard_pct =
-				out->bombard_pct * r->enemy_bombard_pct / 100;
+					counter_multiply_percent (out->defender_def_pct, r->self_def_pct);
+				out->bombard_pct =
+					counter_multiply_percent (out->bombard_pct, r->enemy_bombard_pct);
+			}
 		}
 	}
 }
@@ -9333,7 +9460,7 @@ get_counter_effect_summary (struct c3x_config * cfg,
 void
 apply_counter_rules (struct c3x_config * cfg,
                      Unit * attacker, Unit * defender, Tile * def_tile,
-                     int * out_attacker_atk, int * out_defender_def,
+                     long long * out_attacker_atk, long long * out_defender_def,
                      bool * out_ignore_defensive_bonuses)
 {
 	struct counter_effect_summary effects;
@@ -9343,87 +9470,13 @@ apply_counter_rules (struct c3x_config * cfg,
 	*out_ignore_defensive_bonuses = effects.ignore_defensive_bonuses;
 }
 
-int
+long long
 get_counter_rule_bombard_modifier (struct c3x_config * cfg,
-                                   Unit * bombarder, Unit * target,
-                                   Tile * target_tile)
+                                   Unit * bombarder, Unit * target, Tile * target_tile)
 {
-	if (! (cfg->enable_unit_counters &&
-	       (bombarder != NULL) &&
-	       (target != NULL) &&
-	       (bombarder->Body.UnitTypeID >= 0) &&
-	       (bombarder->Body.UnitTypeID < p_bic_data->UnitTypeCount) &&
-	       (target->Body.UnitTypeID >= 0) &&
-	       (target->Body.UnitTypeID < p_bic_data->UnitTypeCount)))
-		return 100;
-
-	int b_type = bombarder->Body.UnitTypeID;
-	int t_type = target->Body.UnitTypeID;
-	int bombard_pct = 100;
-
-	for (int i = 0; i < cfg->count_counter_rules; i++) {
-		struct counter_rule * r = &cfg->counter_rules[i];
-
-		bool forward = unit_matches_counter_side (cfg, b_type,
-		                   r->attacker_match, r->attacker_tag_id) &&
-		               unit_matches_counter_side (cfg, t_type,
-		                   r->defender_match, r->defender_tag_id);
-
-		bool reverse = unit_matches_counter_side (cfg, b_type,
-		                   r->defender_match, r->defender_tag_id) &&
-		               unit_matches_counter_side (cfg, t_type,
-		                   r->attacker_match, r->attacker_tag_id);
-
-		if (forward &&
-		    ! counter_rule_experience_conditions_match (
-		        r,
-		        bombarder->Body.Combat_Experience,
-		        target->Body.Combat_Experience))
-			forward = false;
-
-		if (reverse &&
-		    ! counter_rule_experience_conditions_match (
-		        r,
-		        target->Body.Combat_Experience,
-		        bombarder->Body.Combat_Experience))
-			reverse = false;
-
-		if ((! forward && ! reverse) ||
-		    ! counter_rule_environment_matches (cfg, r, target_tile))
-			continue;
-
-		if (forward)
-			bombard_pct = bombard_pct * r->self_bombard_pct / 100;
-		if (reverse)
-			bombard_pct = bombard_pct * r->enemy_bombard_pct / 100;
-	}
-
-	return bombard_pct;
-}
-
-int
-counter_adjusted_bombard_strength (int base_strength, int bombard_pct)
-{
-	long long adjusted = (long long)base_strength * bombard_pct / 100;
-	if (adjusted < 0)
-		return 0;
-	if (adjusted > 0x3FFFFFFF)
-		return 0x3FFFFFFF;
-	return (int)adjusted;
-}
-
-int
-counter_adjusted_bombard_target_defense (int base_defense_strength, int bombard_pct)
-{
-	if (bombard_pct <= 0)
-		return 0x3FFFFFFF;
-
-	long long adjusted = (long long)base_defense_strength * 100 / bombard_pct;
-	if (adjusted < 0)
-		return 0;
-	if (adjusted > 0x3FFFFFFF)
-		return 0x3FFFFFFF;
-	return (int)adjusted;
+	struct counter_effect_summary effects;
+	get_counter_effect_summary (cfg, bombarder, target, target_tile, &effects);
+	return effects.bombard_pct;
 }
 
 bool
@@ -24231,6 +24284,8 @@ patch_load_scenario (BIC * this, int edx, char * param_1, unsigned * param_2)
 		load_config (scenario_config_path, 0);
 	}
 	load_config ("custom.c3x_config.ini", 1);
+	if (is->current_config.enable_unit_counters && is->current_config.count_counter_rules > 0)
+		rebuild_counter_rule_match_cache (&is->current_config);
 	apply_machine_code_edits (&is->current_config, false);
 
 	if (is->current_config.enable_districts || is->current_config.enable_natural_wonders) {
@@ -28862,24 +28917,28 @@ draw_detailed_combat_odds_hud (PCX_Image * canvas,
 	matchup[(sizeof matchup) - 1] = '\0';
 
 	bool has_counter_effect = false;
+	char percent[32];
 	if (hud->mode == COHM_BOMBARD) {
-		if (hud->counter_effects.bombard_pct != 100) {
-			snprintf (effect_1, sizeof effect_1, "%s x%d%%",
+		if (hud->counter_effects.bombard_pct != COUNTER_SCALE) {
+			format_counter_percent (percent, sizeof percent, hud->counter_effects.bombard_pct);
+			snprintf (effect_1, sizeof effect_1, "%s x%s%%",
 			          c3x_label_or_fallback (CL_COUNTER_BOMBARD, "Bombard"),
-			          hud->counter_effects.bombard_pct);
+			          percent);
 			has_counter_effect = true;
 		}
 	} else if (hud->mode == COHM_ATTACK) {
-		if (hud->counter_effects.attacker_atk_pct != 100) {
-			snprintf (effect_1, sizeof effect_1, "%s x%d%%",
+		if (hud->counter_effects.attacker_atk_pct != COUNTER_SCALE) {
+			format_counter_percent (percent, sizeof percent, hud->counter_effects.attacker_atk_pct);
+			snprintf (effect_1, sizeof effect_1, "%s x%s%%",
 			          c3x_label_or_fallback (CL_COUNTER_ATTACK, "Attack"),
-			          hud->counter_effects.attacker_atk_pct);
+			          percent);
 			has_counter_effect = true;
 		}
-		if (hud->counter_effects.defender_def_pct != 100) {
-			snprintf (effect_2, sizeof effect_2, "%s x%d%%",
+		if (hud->counter_effects.defender_def_pct != COUNTER_SCALE) {
+			format_counter_percent (percent, sizeof percent, hud->counter_effects.defender_def_pct);
+			snprintf (effect_2, sizeof effect_2, "%s x%s%%",
 			          c3x_label_or_fallback (CL_COUNTER_DEFENSE, "Defense"),
-			          hud->counter_effects.defender_def_pct);
+			          percent);
 			has_counter_effect = true;
 		}
 		if (hud->counter_effects.ignore_defensive_bonuses) {
@@ -30581,8 +30640,8 @@ find_counter_best_bombard_defender_against (Unit * bombarder, int tile_x,
 
 	UnitType * bombarder_type = &p_bic_data->UnitTypes[bombarder->Body.UnitTypeID];
 	Unit * best = NULL;
-	int best_adjusted_defense = -1,
-	    best_base_defense = -1,
+	struct counter_strength_ratio best_adjusted_defense = {0};
+	int best_base_defense = -1,
 	    best_hp = -1,
 	    best_cost = -1;
 	bool any_counter_effect = false;
@@ -30597,24 +30656,25 @@ find_counter_best_bombard_defender_against (Unit * bombarder, int tile_x,
 			bombarder_civ_id, require_visible, &base_defense))
 			continue;
 
-		int bombard_pct = get_counter_rule_bombard_modifier (
+		long long bombard_pct = get_counter_rule_bombard_modifier (
 			&is->current_config, bombarder, candidate, target_tile);
-		if (bombard_pct != 100)
+		if (bombard_pct != COUNTER_SCALE)
 			any_counter_effect = true;
 
-		int adjusted_defense =
-			counter_adjusted_bombard_target_defense (base_defense, bombard_pct);
+		struct counter_strength_ratio adjusted_defense =
+			counter_strength (base_defense, COUNTER_SCALE, bombard_pct, 100);
+		int compare = best ? counter_compare_strengths (adjusted_defense, best_adjusted_defense) : 1;
 		int hp = Unit_get_max_hp (candidate) - candidate->Body.Damage;
 		int cost = p_bic_data->UnitTypes[candidate->Body.UnitTypeID].Cost;
 
 		if ((best == NULL) ||
-		    (adjusted_defense > best_adjusted_defense) ||
-		    ((adjusted_defense == best_adjusted_defense) &&
+		    (compare > 0) ||
+		    ((compare == 0) &&
 		     (base_defense > best_base_defense)) ||
-		    ((adjusted_defense == best_adjusted_defense) &&
+		    ((compare == 0) &&
 		     (base_defense == best_base_defense) &&
 		     (hp > best_hp)) ||
-		    ((adjusted_defense == best_adjusted_defense) &&
+		    ((compare == 0) &&
 		     (base_defense == best_base_defense) &&
 		     (hp == best_hp) &&
 		     (cost > best_cost))) {
@@ -32580,23 +32640,23 @@ patch_Fighter_find_defensive_bombarder (Fighter * this, int edx, Unit * attacker
 			return NULL;
 
 		Unit * tr = NULL;
-		int highest_strength = -1;
+		struct counter_strength_ratio highest_strength = {0};
 		Tile * bombard_target_tile = tile_at (attacker->Body.X, attacker->Body.Y);
 		enum UnitTypeAbilities lethal_bombard_req = (attacker_class == UTC_Sea) ? UTA_Lethal_Sea_Bombardment : UTA_Lethal_Land_Bombardment;
 		FOR_UNITS_ON (uti, defender_tile) {
 			Unit * candidate = uti.unit;
 			UnitType * candidate_type = &p_bic_data->UnitTypes[candidate->Body.UnitTypeID];
-			int candidate_strength = counter_adjusted_bombard_strength (
+			struct counter_strength_ratio candidate_strength = counter_strength (
 				candidate_type->Bombard_Strength,
 				get_counter_rule_bombard_modifier (
 					&is->current_config,
 					candidate,
 					attacker,
-					bombard_target_tile));
+					bombard_target_tile), COUNTER_SCALE, 100);
 			if (can_do_defensive_bombard (candidate, candidate_type) &&
 			    ((attacker_class == UTC_Sea) ||
 			     ! itable_look_up_or (&is->current_config.can_bombard_only_sea_tiles, candidate->Body.UnitTypeID, 0)) &&
-			    (candidate_strength > highest_strength) &&
+			    ((tr == NULL) || counter_compare_strengths (candidate_strength, highest_strength) > 0) &&
 			    (candidate != defender) &&
 			    (Unit_get_containing_army (candidate) != defender) &&
 			    ((attacker_class == candidate_type->Unit_Class) ||
@@ -32682,35 +32742,14 @@ patch_Fighter_damage_by_db_in_main_loop (Fighter * this, int edx, Unit * bombard
 int __fastcall
 patch_Fighter_get_odds_for_bombardment (Fighter * this, int edx, Unit * attacker, Unit * defender, bool bombarding, bool ignore_defensive_bonuses)
 {
-	if (! (bombarding &&
-	       is->current_config.enable_unit_counters &&
-	       (attacker != NULL) &&
-	       (defender != NULL) &&
-	       (attacker->Body.UnitTypeID >= 0) &&
-	       (attacker->Body.UnitTypeID < p_bic_data->UnitTypeCount) &&
-	       (defender->Body.UnitTypeID >= 0) &&
-	       (defender->Body.UnitTypeID < p_bic_data->UnitTypeCount)))
-		return Fighter_get_combat_odds (this, __, attacker, defender, bombarding, ignore_defensive_bonuses);
-
-	Tile * target_tile = tile_at (defender->Body.X, defender->Body.Y);
-	int bombard_pct = get_counter_rule_bombard_modifier (
-		&is->current_config,
-		attacker,
-		defender,
-		target_tile);
-
-	if (bombard_pct == 100)
-		return Fighter_get_combat_odds (this, __, attacker, defender, bombarding, ignore_defensive_bonuses);
-
-	UnitType * attacker_type = &p_bic_data->UnitTypes[attacker->Body.UnitTypeID];
-	int saved_bombard_strength = attacker_type->Bombard_Strength;
-	attacker_type->Bombard_Strength =
-		counter_adjusted_bombard_strength (saved_bombard_strength, bombard_pct);
-
-	int result = Fighter_get_combat_odds (this, __, attacker, defender, bombarding, ignore_defensive_bonuses);
-
-	attacker_type->Bombard_Strength = saved_bombard_strength;
-	return result;
+	int base = Fighter_get_combat_odds (this, __, attacker, defender, bombarding, ignore_defensive_bonuses);
+	if (! (bombarding && is->current_config.enable_unit_counters &&
+	       is->current_config.count_counter_rules > 0 &&
+	       unit_has_valid_type_id (attacker) && unit_has_valid_type_id (defender)))
+		return base;
+	long long multiplier = get_counter_rule_bombard_modifier (
+		&is->current_config, attacker, defender, tile_at (defender->Body.X, defender->Body.Y));
+	return counter_adjust_odds (base, multiplier, COUNTER_SCALE);
 }
 
 int __fastcall
@@ -32718,40 +32757,20 @@ patch_Fighter_get_odds_for_main_combat_loop (Fighter * this, int edx, Unit * att
 {
 	if (is->combat_unit_display_override_active && (defender != NULL))
 		set_combat_unit_display_override (defender);
-
+	// Existing lethal defensive bombard sentinel is outside ordinary round odds.
 	if (is->dbe.defender_was_destroyed)
 		return 1025;
-
-	struct c3x_config * cfg = &is->current_config;
-	// Only OR in counter-rule defensive-bonus skipping when we actually ran
-	// apply_counter_rules for this call. Otherwise counter_combat_ctx can be
-	// stale from an earlier combat
-	// round or a future odds probe.
-	bool ignore_defensive_bonuses_for_odds = ignore_defensive_bonuses;
-	if (cfg->enable_unit_counters && attacker != NULL && defender != NULL) {
-		Tile * def_tile = tile_at (this->defender_location_x,
-		                           this->defender_location_y);
-		int  aa, dd;
-		bool rule_ignore_defensive_bonuses;
-		apply_counter_rules (cfg, attacker, defender, def_tile,
-		                     &aa, &dd,
-		                     &rule_ignore_defensive_bonuses);
-
-		is->counter_combat_ctx.active          = true;
-		is->counter_combat_ctx.attacker        = attacker;
-		is->counter_combat_ctx.defender        = defender;
-		is->counter_combat_ctx.attacker_atk_pct = aa;
-		is->counter_combat_ctx.defender_def_pct = dd;
-		is->counter_combat_ctx.ignore_defensive_bonuses =
-			rule_ignore_defensive_bonuses;
-		ignore_defensive_bonuses_for_odds =
-			ignore_defensive_bonuses || rule_ignore_defensive_bonuses;
-	}
-
-	int result = Fighter_get_combat_odds (this, __, attacker, defender, bombarding,
-	                                      ignore_defensive_bonuses_for_odds);
-	is->counter_combat_ctx.active = false;
-	return result;
+	if (bombarding)
+		return patch_Fighter_get_odds_for_bombardment (this, __, attacker, defender, true, ignore_defensive_bonuses);
+	struct counter_effect_summary effects;
+	init_neutral_counter_effect_summary (&effects);
+	if (is->current_config.enable_unit_counters && is->current_config.count_counter_rules > 0 &&
+	    unit_has_valid_type_id (attacker) && unit_has_valid_type_id (defender))
+		get_counter_effect_summary (&is->current_config, attacker, defender,
+		                            tile_at (this->defender_location_x, this->defender_location_y), &effects);
+	int base = Fighter_get_combat_odds (this, __, attacker, defender, false,
+	                                   ignore_defensive_bonuses || effects.ignore_defensive_bonuses);
+	return counter_adjust_odds (base, effects.attacker_atk_pct, effects.defender_def_pct);
 }
 
 bool
@@ -32851,14 +32870,6 @@ patch_Fighter_do_charm_bombard_tile (Fighter * this, int edx, Unit * unit, int n
 	charm_bombard_units_on_tile (this, unit, tile_at (tile_x, tile_y));
 }
 
-long long
-divide_counter_strength (long long numerator, int denominator)
-{
-	if (denominator <= 0)
-		return 0x3FFFFFFF;
-	return numerator / denominator;
-}
-
 bool
 counter_tile_has_river_edge (Tile * tile, enum direction dir)
 {
@@ -32938,85 +32949,44 @@ counter_defender_selection_defensive_bonus_percent (Unit * attacker,
 	return bonus;
 }
 
-int
-counter_adjusted_defender_strength (Unit * attacker,
-                                    Unit * defender,
-                                    int defender_strength,
-                                    bool include_defensive_bonuses)
+struct counter_strength_ratio
+counter_adjusted_defender_strength_from_effects (Unit * attacker, Unit * defender,
+                                                Tile * tile, int strength,
+                                                bool include_defensive_bonuses,
+                                                struct counter_effect_summary * effects)
 {
-	if (! (is->current_config.enable_unit_counters &&
-	       unit_has_valid_type_id (attacker) &&
-	       unit_has_valid_type_id (defender)))
-		return defender_strength;
-
-	Tile * def_tile = tile_at (defender->Body.X, defender->Body.Y);
-	if ((def_tile == NULL) || (def_tile == p_null_tile))
-		return defender_strength;
-
-	int  attacker_atk_pct, defender_def_pct;
-	bool ignore_defensive_bonuses;
-	apply_counter_rules (&is->current_config, attacker, defender, def_tile,
-	                     &attacker_atk_pct, &defender_def_pct,
-	                     &ignore_defensive_bonuses);
-
-	if ((attacker_atk_pct == 100) &&
-	    (defender_def_pct == 100) &&
-	    (! include_defensive_bonuses || ignore_defensive_bonuses))
-		return defender_strength;
-
-	if (attacker_atk_pct <= 0)
-		return 0x3FFFFFFF;
-
-	long long adjusted = (long long)defender_strength * defender_def_pct / 100;
-	if (include_defensive_bonuses && ! ignore_defensive_bonuses) {
-		int bonus =
-			counter_defender_selection_defensive_bonus_percent (
-				attacker, defender, def_tile);
-		adjusted = adjusted * (100 + bonus) / 100;
-	}
-
-	adjusted = divide_counter_strength (
-		adjusted * 100,
-		attacker_atk_pct);
-	if (adjusted < 0)
-		return 0;
-	if (adjusted > 0x3FFFFFFF)
-		return 0x3FFFFFFF;
-	return (int)adjusted;
+	int bonus = 100;
+	if (include_defensive_bonuses && ! effects->ignore_defensive_bonuses)
+		bonus += counter_defender_selection_defensive_bonus_percent (attacker, defender, tile);
+	return counter_strength (strength, effects->defender_def_pct, effects->attacker_atk_pct, bonus);
 }
 
-int
-counter_adjusted_attacker_strength (Unit * attacker, Unit * defender, int attacker_strength)
+// The engine's army selector multiplies base attack by member HP and rotates
+// through HP bands. Compare these supplied scores as fractions here instead of
+// scaling the integer getter (which used to erase small bonuses).
+bool __fastcall
+patch_Fighter_prefer_first_attacker (Fighter * this, int edx, Unit * first, int first_strength,
+                                     Unit * second, int second_strength, bool positive_only)
 {
-	if (! (is->current_config.enable_unit_counters &&
-	       unit_has_valid_type_id (attacker) &&
-	       unit_has_valid_type_id (defender)))
-		return attacker_strength;
-
-	Tile * def_tile = tile_at (defender->Body.X, defender->Body.Y);
-	if ((def_tile == NULL) || (def_tile == p_null_tile))
-		return attacker_strength;
-
-	int  attacker_atk_pct, defender_def_pct;
-	bool ignore_defensive_bonuses;
-	apply_counter_rules (&is->current_config, attacker, defender, def_tile,
-	                     &attacker_atk_pct, &defender_def_pct,
-	                     &ignore_defensive_bonuses);
-
-	if ((attacker_atk_pct == 100) && (defender_def_pct == 100))
-		return attacker_strength;
-
-	if (defender_def_pct <= 0)
-		return 0x3FFFFFFF;
-
-	long long adjusted = divide_counter_strength (
-		(long long)attacker_strength * attacker_atk_pct,
-		defender_def_pct);
-	if (adjusted < 0)
-		return 0;
-	if (adjusted > 0x3FFFFFFF)
-		return 0x3FFFFFFF;
-	return (int)adjusted;
+	struct counter_army_attacker_selection_context * ctx = &is->counter_army_attacker_selection_ctx;
+	if (ctx->active && unit_has_valid_type_id (first) && unit_has_valid_type_id (second)) {
+		struct counter_effect_summary f, s;
+		get_counter_effect_summary (&is->current_config, first, ctx->defender, ctx->tile, &f);
+		get_counter_effect_summary (&is->current_config, second, ctx->defender, ctx->tile, &s);
+		if (! counter_effects_change_combat (&f) && ! counter_effects_change_combat (&s))
+			return Fighter_prefer_first_attacker (this, __, first, first_strength, second, second_strength, positive_only);
+		// Do not introduce defensive-bonus engine probes in this hot comparison.
+		// Like the original army metric, use the supplied HP-weighted strength.
+		// Ignore-bonus effects are honored by actual odds; exact candidate odds
+		// ranking requires preparation outside this path (see precision notes).
+		struct counter_strength_ratio fr = counter_strength (first_strength, f.attacker_atk_pct, f.defender_def_pct, 100);
+		struct counter_strength_ratio sr = counter_strength (second_strength, s.attacker_atk_pct, s.defender_def_pct, 100);
+		int cmp = counter_compare_strengths (fr, sr);
+		if (cmp) return cmp > 0;
+		// Equal rational scores: preserve the engine's defense/bombard/HP ties.
+		first_strength = second_strength = (first_strength > 0 || second_strength > 0) ? 1 : 0;
+	}
+	return Fighter_prefer_first_attacker (this, __, first, first_strength, second, second_strength, positive_only);
 }
 
 Unit *
@@ -33024,6 +32994,7 @@ select_counter_best_attacking_army_member (Unit * army, Unit * defender,
                                            int army_hp_remaining)
 {
 	if (! (is->current_config.enable_unit_counters &&
+	       is->current_config.count_counter_rules > 0 &&
 	       unit_has_valid_type_id (army) &&
 	       unit_has_valid_type_id (defender) &&
 	       Unit_has_ability (army, __, UTA_Army)))
@@ -33047,11 +33018,11 @@ select_counter_best_attacking_army_member (Unit * army, Unit * defender,
 		is->counter_army_attacker_selection_ctx;
 	is->counter_army_attacker_selection_ctx =
 		(struct counter_army_attacker_selection_context) {
-			true, army, defender
+			true, army, defender, tile_at (defender->Body.X, defender->Body.Y)
 		};
 
 	// Keep the base selector's HP allocation and tie-breaking. Its calls to
-	// get_attack_strength are adjusted by the temporary context above.
+	// prefer_first_attacker are compared as rational scores in the context above.
 	Unit * selected = Unit_select_army_member_for_combat (
 		army, __, army_hp_remaining, true);
 
@@ -33085,6 +33056,7 @@ patch_Fighter_prefer_first_defender_1 (Fighter * this, int edx, Unit * first, in
 		attacker = is->counter_defender_selection_ctx.attacker;
 
 	if (is->current_config.enable_unit_counters &&
+	    is->current_config.count_counter_rules > 0 &&
 	    unit_has_valid_type_id (attacker) &&
 	    unit_has_valid_type_id (first) &&
 	    unit_has_valid_type_id (second) &&
@@ -33096,28 +33068,21 @@ patch_Fighter_prefer_first_defender_1 (Fighter * this, int edx, Unit * first, in
 		Unit * second_attacker = counter_attacker_for_defender_selection (attacker, second);
 		Tile * first_tile = tile_at (first->Body.X, first->Body.Y);
 		Tile * second_tile = tile_at (second->Body.X, second->Body.Y);
-		int unused_atk_pct, unused_def_pct;
-		bool first_ignore_defensive_bonuses = false,
-		     second_ignore_defensive_bonuses = false;
-		if ((first_tile != NULL) && (first_tile != p_null_tile))
-			apply_counter_rules (
-				&is->current_config, first_attacker, first,
-				first_tile, &unused_atk_pct, &unused_def_pct,
-				&first_ignore_defensive_bonuses);
-		if ((second_tile != NULL) && (second_tile != p_null_tile))
-			apply_counter_rules (
-				&is->current_config, second_attacker, second,
-				second_tile, &unused_atk_pct, &unused_def_pct,
-				&second_ignore_defensive_bonuses);
-		bool include_defensive_bonuses =
-			first_ignore_defensive_bonuses ||
-			second_ignore_defensive_bonuses;
-		first_strength = counter_adjusted_defender_strength (
-			first_attacker, first, first_strength,
-			include_defensive_bonuses);
-		second_strength = counter_adjusted_defender_strength (
-			second_attacker, second, second_strength,
-			include_defensive_bonuses);
+		struct counter_effect_summary first_effects, second_effects;
+		get_counter_effect_summary (&is->current_config, first_attacker, first, first_tile, &first_effects);
+		get_counter_effect_summary (&is->current_config, second_attacker, second, second_tile, &second_effects);
+		if (counter_effects_change_combat (&first_effects) || counter_effects_change_combat (&second_effects)) {
+			bool include_bonuses = first_effects.ignore_defensive_bonuses || second_effects.ignore_defensive_bonuses;
+			struct counter_strength_ratio f = counter_adjusted_defender_strength_from_effects (
+				first_attacker, first, first_tile, first_strength, include_bonuses, &first_effects);
+			struct counter_strength_ratio s = counter_adjusted_defender_strength_from_effects (
+				second_attacker, second, second_tile, second_strength, include_bonuses, &second_effects);
+			int cmp = counter_compare_strengths (f, s);
+			// Pass only an ordering to the engine, preserving king priority and ties.
+			// These ranks never enter combat odds or unit strength getters.
+			first_strength = first_strength <= 0 ? first_strength : (cmp > 0 ? 2 : 1);
+			second_strength = second_strength <= 0 ? second_strength : (cmp < 0 ? 2 : 1);
+		}
 	}
 
 	if (is->current_config.prefer_less_expensive_defenders &&
@@ -33205,14 +33170,14 @@ find_counter_best_defender_against (Unit * attacker, Tile * tile, int tile_x,
 			Unit * counter_attacker =
 				counter_attacker_for_defender_selection (
 					attacker, unit);
-			int attacker_atk_pct, defender_def_pct;
+			long long attacker_atk_pct, defender_def_pct;
 			bool ignore_defensive_bonuses;
 			apply_counter_rules (
 				&is->current_config, counter_attacker, unit, tile,
 				&attacker_atk_pct, &defender_def_pct,
 				&ignore_defensive_bonuses);
-			if ((attacker_atk_pct != 100) ||
-			    (defender_def_pct != 100) ||
+			if ((attacker_atk_pct != COUNTER_SCALE) ||
+			    (defender_def_pct != COUNTER_SCALE) ||
 			    ignore_defensive_bonuses)
 				*out_any_counter_effect = true;
 		}
@@ -33294,39 +33259,19 @@ patch_Fighter_fight (Fighter * this, int edx, Unit * attacker,
 	is->saved_combat_unit_display_override = saved_combat_udo;
 	is->combat_unit_display_override_active = saved_combat_udo_active;
 	is->dbe = (struct defensive_bombard_event) {0};
-	is->counter_combat_ctx.active = false;
 	return tr;
 }
 
 int __fastcall
 patch_Unit_get_attack_strength (Unit * this)
 {
-	int base = Unit_get_attack_strength (this);
-	if (is->counter_army_attacker_selection_ctx.active &&
-	    unit_has_valid_type_id (
-		is->counter_army_attacker_selection_ctx.army) &&
-	    unit_has_valid_type_id (this) &&
-	    (this->Body.Container_Unit ==
-	     is->counter_army_attacker_selection_ctx.army->Body.ID))
-		return counter_adjusted_attacker_strength (
-			this,
-			is->counter_army_attacker_selection_ctx.defender,
-			base);
-	if (! is->counter_combat_ctx.active)
-		return base;
-	if (this == is->counter_combat_ctx.attacker)
-		return base * is->counter_combat_ctx.attacker_atk_pct / 100;
-	return base;
+	return Unit_get_attack_strength (this);
 }
 
 int __fastcall
 patch_Unit_get_defense_strength (Unit * this)
 {
-	int base = Unit_get_defense_strength (this);
-	if (is->counter_combat_ctx.active &&
-	    (this == is->counter_combat_ctx.defender))
-		return base * is->counter_combat_ctx.defender_def_pct / 100;
-	return base;
+	return Unit_get_defense_strength (this);
 }
 
 void __fastcall
@@ -33784,7 +33729,6 @@ calc_attacker_win_chance_for_hud (Unit * attacker, Unit * defender,
 	double round_win_chance = attacker_round_win_chance_from_fighter_odds (odds);
 
 	p_bic_data->fighter = saved_fighter;
-	is->counter_combat_ctx.active = false;
 	return calc_attacker_combat_win_chance_from_round_chance (
 		round_win_chance, combat_odds_hud_unit_current_hp (attacker),
 		combat_odds_hud_unit_current_hp (defender));

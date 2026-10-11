@@ -301,10 +301,18 @@ struct counter_rule {
 };
 
 struct counter_effect_summary {
-	int attacker_atk_pct;
-	int defender_def_pct;
-	int bombard_pct;
+	// Fixed point: COUNTER_SCALE is 100%; configuration rules remain percentages.
+	long long attacker_atk_pct;
+	long long defender_def_pct;
+	long long bombard_pct;
 	bool ignore_defensive_bonuses;
+};
+
+struct counter_rule_match_cache {
+	bool built;
+	int rule_count, unit_type_count, words;
+	unsigned int * attacker_side_bits;
+	unsigned int * defender_side_bits;
 };
 
 struct c3x_config {
@@ -2168,16 +2176,7 @@ struct injected_state {
 	struct unit_display_override saved_bombard_target_display_override_2;
 	struct unit_display_override current_bombard_target_display_override;
 
-	// Set in patch_Fighter_get_odds_for_main_combat_loop, read by patch_Unit_get_attack/defense_strength.
-	// Stores counter multipliers for the current combat. Active only during Fighter_get_combat_odds call.
-	struct {
-		bool   active;
-		Unit * attacker;
-		Unit * defender;
-		int    attacker_atk_pct;  // Attacker attack multiplier (combines forward self-atk and reverse enemy-atk)
-		int    defender_def_pct;  // Defender defense multiplier (combines forward enemy-def and reverse self-def)
-		bool   ignore_defensive_bonuses; // Counter rule makes the defender receive no defensive bonuses
-	} counter_combat_ctx;
+	struct counter_rule_match_cache counter_match_cache;
 	// Set while Fighter::begin is choosing a defender so Fighter::prefer_first_defender_1 can apply counter-adjusted strengths.
 	struct counter_defender_selection_context {
 		bool   active;
@@ -2186,12 +2185,13 @@ struct injected_state {
 		int    tile_y;
 	} counter_defender_selection_ctx;
 	// Set while the base army-member selector is ranking attacking members. This
-	// lets get_attack_strength expose counter-adjusted values without replacing
+	// lets the comparison hook use rational scores without replacing
 	// the base selector's HP-band logic.
 	struct counter_army_attacker_selection_context {
 		bool   active;
 		Unit * army;
 		Unit * defender;
+		Tile * tile;
 	} counter_army_attacker_selection_ctx;
 
 	struct combat_odds_hud_state {
