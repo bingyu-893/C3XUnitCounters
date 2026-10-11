@@ -20339,6 +20339,8 @@ patch_init_floating_point ()
 		{"anarchy_length_percent"                            ,   100,  offsetof (struct c3x_config, anarchy_length_percent)},
 		{"steal_plans_duration"                              ,     1,  offsetof (struct c3x_config, steal_plans_duration)},
 		{"ai_multi_city_start"                               ,     0,  offsetof (struct c3x_config, ai_multi_city_start)},
+		{"ai_multi_city_start_radius"                        ,     0,  offsetof (struct c3x_config, ai_multi_city_start_radius)},
+		{"ai_multi_city_start_min_distance"                  ,     0,  offsetof (struct c3x_config, ai_multi_city_start_min_distance)},
 		{"max_tries_to_place_fp_city"                        , 10000,  offsetof (struct c3x_config, max_tries_to_place_fp_city)},
 		{"ai_research_multiplier"                            ,   100,  offsetof (struct c3x_config, ai_research_multiplier)},
 		{"ai_settler_perfume_on_founding_duration"           ,     0,  offsetof (struct c3x_config, ai_settler_perfume_on_founding_duration)},
@@ -29521,6 +29523,15 @@ on_lose_city (Leader * leader, City * city, enum city_loss_reason reason)
 		is->distribution_hub_totals_dirty = true;
 }
 
+// Civ's staggered coordinates put all eight neighbors at a wrapped dx + dy of two.
+int
+ai_start_tile_distance (Map * map, int ax, int ay, int bx, int by)
+{
+	int dx = compute_wrapped_component (int_abs (ax - bx), map->Width, map->Flags & 1);
+	int dy = compute_wrapped_component (int_abs (ay - by), map->Height, map->Flags & 2);
+	return (dx + dy) / 2;
+}
+
 // Returns -1 if the location is unusable, 0-9 if it's usable but doesn't satisfy all criteria, and 10 if it couldn't be better
 int
 eval_starting_location (Map * map, int const * alt_starting_locs, int alt_starting_loc_count, int tile_x, int tile_y, int civ_id)
@@ -29533,11 +29544,25 @@ eval_starting_location (Map * map, int const * alt_starting_locs, int alt_starti
 		int tr = 0;
 
 		// Avoid this location if it's too close to another starting location. If it's much too close, it's ruled out entirely.
+		bool use_radius = (is->current_config.ai_multi_city_start > 1) && (is->current_config.ai_multi_city_start_radius > 0);
+		int min_distance = (is->current_config.ai_multi_city_start > 1) ? is->current_config.ai_multi_city_start_min_distance : 0;
+		int min_sep = is->current_config.minimum_city_separation;
+		if (min_sep < 1)
+			min_sep = 1;
 		int closest_dist = INT_MAX;
 		for (int n = 1; n <= map->Civ_Count; n++)
 			if (map->Starting_Locations[n] >= 0) {
 				int other_x, other_y;
 				tile_index_to_coords (map, map->Starting_Locations[n], &other_x, &other_y);
+				bool same_civ = n == civ_id;
+				if (use_radius || (same_civ && (min_distance > 0))) {
+					// These cities have not been created yet, so the engine cannot enforce their separation.
+					int tile_dist = ai_start_tile_distance (map, tile_x, tile_y, other_x, other_y);
+					if ((tile_dist <= min_sep) || (same_civ && (tile_dist < min_distance)))
+						return -1;
+					if (use_radius && same_civ)
+						continue;
+				}
 				int dist = Map_get_x_dist (map, __, tile_x, other_x) + Map_get_y_dist (map, __, tile_y, other_y);
 				if (dist < closest_dist)
 					closest_dist = dist;
@@ -29546,6 +29571,15 @@ eval_starting_location (Map * map, int const * alt_starting_locs, int alt_starti
 			if (alt_starting_locs[n] >= 0) {
 				int other_x, other_y;
 				tile_index_to_coords (map, alt_starting_locs[n], &other_x, &other_y);
+				// Each block of 32 locations is indexed by civilization ID.
+				bool same_civ = n % 32 == civ_id;
+				if (use_radius || (same_civ && (min_distance > 0))) {
+					int tile_dist = ai_start_tile_distance (map, tile_x, tile_y, other_x, other_y);
+					if ((tile_dist <= min_sep) || (same_civ && (tile_dist < min_distance)))
+						return -1;
+					if (use_radius && same_civ)
+						continue;
+				}
 				int dist = Map_get_x_dist (map, __, tile_x, other_x) + Map_get_y_dist (map, __, tile_y, other_y);
 				if (dist < closest_dist)
 					closest_dist = dist;
@@ -29577,6 +29611,62 @@ eval_starting_location (Map * map, int const * alt_starting_locs, int alt_starti
 		return (10*tr)/max_score;
 	} else
 		return -1;
+}
+
+// local_candidates is a reusable TileCount-sized buffer, or NULL to skip the local search.
+int
+find_ai_extra_city_location (Map * map, int const * alt_starting_locs, int alt_starting_loc_count, int civ_id, int * local_candidates)
+{
+	int best_loc_val = -1, best_loc_index = -1;
+	int max_tries = is->current_config.max_tries_to_place_fp_city;
+	int radius = is->current_config.ai_multi_city_start_radius;
+	if ((local_candidates != NULL) && (is->current_config.ai_multi_city_start > 1) && (radius > 0) && (max_tries > 0)) {
+		int start_x, start_y;
+		tile_index_to_coords (map, map->Starting_Locations[civ_id], &start_x, &start_y);
+		int count = 0;
+		for (int index = 0; index < map->TileCount; index++) {
+			int x, y;
+			tile_index_to_coords (map, index, &x, &y);
+			if (ai_start_tile_distance (map, start_x, start_y, x, y) <= radius)
+				local_candidates[count++] = index;
+		}
+
+		for (int try = 0; (try < max_tries) && (count > 0); try++) {
+			// Remove the sampled entry by replacing it with the last remaining entry.
+			int pick = rand_int (p_rand_object, __, count);
+			int index = local_candidates[pick];
+			local_candidates[pick] = local_candidates[--count];
+			int x, y;
+			tile_index_to_coords (map, index, &x, &y);
+			int val = eval_starting_location (map, alt_starting_locs, alt_starting_loc_count, x, y, civ_id);
+			if (val >= 10)
+				return index;
+			else if (val > best_loc_val) {
+				best_loc_val = val;
+				best_loc_index = index;
+			}
+		}
+		if (best_loc_index >= 0)
+			return best_loc_index;
+	}
+
+	// Preserve the original whole-map search, including its RNG calls, when the radius is disabled.
+	for (int try = 0; try < max_tries; try++) {
+		int i_loc = rand_int (p_rand_object, __, map->TileCount);
+		int x_loc, y_loc;
+		tile_index_to_coords (map, i_loc, &x_loc, &y_loc);
+		if ((x_loc >= 0) && (y_loc >= 0)) {
+			int val = eval_starting_location (map, alt_starting_locs, alt_starting_loc_count, x_loc, y_loc, civ_id);
+			if (val >= 10) {
+				best_loc_index = i_loc;
+				break;
+			} else if (val > best_loc_val) {
+				best_loc_val = val;
+				best_loc_index = i_loc;
+			}
+		}
+	}
+	return best_loc_index;
 }
 
 City *
@@ -29616,6 +29706,10 @@ set_up_ai_multi_city_start (Map * map, int city_count)
 	// Generate alternate sets of starting locations. We need one set for each extra city we're going to create per player. Each set only needs to
 	// include starting locations for eligible players, all others will be left as -1.
 	int alt_starting_loc_count = 32 * (city_count - 1);
+	int * local_candidates = NULL;
+	if ((city_count > 1) && (is->current_config.ai_multi_city_start_radius > 0) &&
+	    (is->current_config.max_tries_to_place_fp_city > 0))
+		local_candidates = malloc (map->TileCount * sizeof *local_candidates);
 	int * alt_starting_locs = malloc (alt_starting_loc_count * sizeof *alt_starting_locs); {
 		for (int n = 0; n < alt_starting_loc_count; n++)
 			alt_starting_locs[n] = -1;
@@ -29623,30 +29717,15 @@ set_up_ai_multi_city_start (Map * map, int city_count)
 		for (int i_loc = 0; i_loc < alt_starting_loc_count; i_loc++) {
 			int civ_id = i_loc % 32;
 			if ((civ_id != 0) && (eligibility_bits & 1<<civ_id)) {
-				int best_loc_val   = -1,
-				    best_loc_index = -1;
-
-				for (int try = 0; try < is->current_config.max_tries_to_place_fp_city; try++) {
-					int i_loc = rand_int (p_rand_object, __, map->TileCount);
-					int x_loc, y_loc;
-					tile_index_to_coords (map, i_loc, &x_loc, &y_loc);
-					if ((x_loc >= 0) && (y_loc >= 0)) {
-						int val = eval_starting_location (map, alt_starting_locs, alt_starting_loc_count, x_loc, y_loc, civ_id);
-						if (val >= 10) {
-							best_loc_index = i_loc;
-							break;
-						} else if (val > best_loc_val) {
-							best_loc_val = val;
-							best_loc_index = i_loc;
-						}
-					}
-				}
+				int best_loc_index = find_ai_extra_city_location (map, alt_starting_locs, alt_starting_loc_count, civ_id, local_candidates);
 
 				if (best_loc_index >= 0)
 					alt_starting_locs[i_loc] = best_loc_index;
 			}
 		}
 	}
+
+	free (local_candidates);
 
 	int count_cities_created = 0;
 	int count_eligible_civs_handled = 0;

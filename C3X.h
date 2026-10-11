@@ -368,6 +368,8 @@ struct c3x_config {
 	bool allow_defensive_retreat_on_water;
 	struct table limit_defensive_retreat_on_water_to_types; // Table mapping unit type IDs to 1's; used as a hash set
 	int ai_multi_city_start;
+	int ai_multi_city_start_radius;
+	int ai_multi_city_start_min_distance;
 	int max_tries_to_place_fp_city;
 	int * ai_multi_start_extra_palaces;
 	int count_ai_multi_start_extra_palaces;
