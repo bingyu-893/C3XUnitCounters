@@ -487,6 +487,7 @@ struct c3x_config {
 	bool no_land_anti_air_from_inside_naval_transport;
 	enum special_helicopter_rules special_helicopter_rules;
 	bool prevent_enslaving_by_bombardment;
+	bool allow_sacrificing_own_units;
 	int years_to_double_building_culture;
 	int tourism_time_scale_percent;
 	bool allow_sale_of_small_wonders;

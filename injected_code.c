@@ -18411,6 +18411,11 @@ apply_machine_code_edits (struct c3x_config const * cfg, bool at_program_start)
 {
 	DWORD old_protect, unused;
 
+	// Unit::sacrifice repeats the nationality check independently of the command/AI eligibility queries.
+	// Remove only its "same nationality -> failure" jump, preserving the original consumption and culture logic.
+	// set_nopification restores the original jump when a later config disables this option.
+	set_nopification (cfg->allow_sacrificing_own_units, ADDR_SACRIFICE_NATIONALITY_CHECK, 2);
+
 	// Replace only the load of FoodPerCitizen. The following original instructions store ECX as the city's food yield.
 	WITH_MEM_PROTECTION (ADDR_CITY_CENTER_FOOD_BASE_LOAD, 6, PAGE_EXECUTE_READWRITE) {
 		if (cfg->city_center_food_yield == CCFY_STANDARD)
@@ -20318,6 +20323,7 @@ patch_init_floating_point ()
 		{"allow_unload_from_army"                                , false, offsetof (struct c3x_config, allow_unload_from_army)},
 		{"no_land_anti_air_from_inside_naval_transport"          , false, offsetof (struct c3x_config, no_land_anti_air_from_inside_naval_transport)},
 		{"prevent_enslaving_by_bombardment"                      , false, offsetof (struct c3x_config, prevent_enslaving_by_bombardment)},
+		{"allow_sacrificing_own_units"                           , false, offsetof (struct c3x_config, allow_sacrificing_own_units)},
 		{"allow_adjacent_resources_of_different_types"           , false, offsetof (struct c3x_config, allow_adjacent_resources_of_different_types)},
 		{"allow_corruption_in_capital"                           , false, offsetof (struct c3x_config, allow_corruption_in_capital)},
 		{"allow_sale_of_small_wonders"                           , false, offsetof (struct c3x_config, allow_sale_of_small_wonders)},
@@ -22567,9 +22573,35 @@ patch_Map_check_colony_location (Map * this, int edx, int tile_x, int tile_y, in
 	return 0;
 }
 
+// Mirrors the sacrifice-specific checks in Unit_can_perform_command and Unit_ai_can_sacrifice,
+// except for comparing the unit's RaceID with its owner's RaceID. Keep nationality itself unchanged.
+bool
+unit_can_sacrifice_ignoring_nationality (Unit * unit, bool requires_city)
+{
+	return (unit->Body.CivID != 0) &&
+		! Unit_has_ability (unit, __, UTA_Flag_Unit) &&
+		(Unit_get_max_hp (unit) > unit->Body.Damage) &&
+		Leader_has_tech_with_flag (&leaders[unit->Body.CivID], __, ATF_Permits_Sacrifice) &&
+		(! requires_city || (city_at (unit->Body.X, unit->Body.Y) != NULL));
+}
+
+bool
+unit_can_perform_sacrifice_ignoring_nationality (Unit * unit)
+{
+	// These are the common command prerequisites, which the AI's planning query does not require.
+	int sacrifice_action = UCV_Sacrifice & 0x0FFFFFFF;
+	return (patch_Unit_get_max_move_points (unit) > unit->Body.Moves) &&
+		((p_bic_data->UnitTypes[unit->Body.UnitTypeID].Special_Actions & sacrifice_action) != 0) &&
+		Map_in_range (&p_bic_data->Map, __, unit->Body.X, unit->Body.Y) &&
+		unit_can_sacrifice_ignoring_nationality (unit, true);
+}
+
 bool __fastcall
 patch_Unit_can_perform_command (Unit * this, int edx, int unit_command_value)
 {
+	if ((unit_command_value == UCV_Sacrifice) && is->current_config.allow_sacrificing_own_units)
+		return unit_can_perform_sacrifice_ignoring_nationality (this);
+
 	if (is->current_config.enable_districts || is->current_config.enable_natural_wonders) {
 		Tile * tile = tile_at (this->Body.X, this->Body.Y);
 
@@ -40960,6 +40992,8 @@ patch_Unit_ai_can_sacrifice (Unit * this, int edx, bool requires_city)
 	UnitType * type = &p_bic_data->UnitTypes[this->Body.UnitTypeID];
 	if (is->current_config.patch_ai_can_sacrifice_without_special_ability && ((type->Special_Actions & sacrifice_action) == 0))
 		return false;
+	else if (is->current_config.allow_sacrificing_own_units)
+		return unit_can_sacrifice_ignoring_nationality (this, requires_city);
 	else
 		return Unit_ai_can_sacrifice (this, __, requires_city);
 }
