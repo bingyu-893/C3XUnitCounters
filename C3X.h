@@ -500,6 +500,7 @@ struct c3x_config {
 	enum barbarian_activity_override override_barbarian_activity_level_for_scenario_maps;
 	bool initialize_preplaced_scenario_leaders_as_mgls;
 	bool enable_unit_counters;
+	bool debug_air_combat_counters;
 	struct counter_rule * counter_rules;
 	int count_counter_rules;
 
@@ -2177,6 +2178,15 @@ struct injected_state {
 	struct unit_display_override current_bombard_target_display_override;
 
 	struct counter_rule_match_cache counter_match_cache;
+	// Scoped to Fighter::do_air_combat, including its network-message entry.
+	// Aircraft remain at their bases; environment rules use the mission target.
+	struct counter_air_combat_context {
+		Fighter * fighter;
+		Unit * interceptor; // Combat attacker
+		Unit * defender;    // Aircraft performing the mission
+		int tile_x, tile_y;
+		char * debug_report; // Optional stack buffer owned by the current wrapper.
+	} counter_air_combat_ctx;
 	// Set while Fighter::begin is choosing a defender so Fighter::prefer_first_defender_1 can apply counter-adjusted strengths.
 	struct counter_defender_selection_context {
 		bool   active;

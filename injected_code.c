@@ -20380,6 +20380,7 @@ patch_init_floating_point ()
 		{"terrain_visibility_bonus_can_stack"                    , false, offsetof (struct c3x_config, terrain_visibility_bonus_can_stack)},
 		{"terrain_visibility_flat_bonus_can_stack"               , false, offsetof (struct c3x_config, terrain_visibility_flat_bonus_can_stack)},
 		{"enable_unit_counters"                                  , false, offsetof (struct c3x_config, enable_unit_counters)},
+		{"debug_air_combat_counters"                              , false, offsetof (struct c3x_config, debug_air_combat_counters)},
 	};
 
 	struct integer_config_option {
@@ -20694,6 +20695,7 @@ patch_init_floating_point ()
 	is->saved_bombard_target_display_override = (struct unit_display_override) {-1, -1, -1};
 	is->saved_bombard_target_display_override_2 = (struct unit_display_override) {-1, -1, -1};
 	is->current_bombard_target_display_override = (struct unit_display_override) {-1, -1, -1};
+	is->counter_air_combat_ctx = (struct counter_air_combat_context) {0};
 	is->counter_defender_selection_ctx = (struct counter_defender_selection_context) {0};
 	is->counter_army_attacker_selection_ctx =
 		(struct counter_army_attacker_selection_context) {0};
@@ -32737,6 +32739,100 @@ patch_Fighter_damage_by_db_in_main_loop (Fighter * this, int edx, Unit * bombard
 		is->unit_display_override = saved_udo;
 		is->unit_display_override_2 = saved_udo_2;
 	}
+}
+
+// Capture only the first real round, before either aircraft can be destroyed.
+// Formatting is opt-in and never runs in the ordinary strength/selection hooks.
+void
+format_counter_air_combat_debug (char * report, int capacity, struct counter_air_combat_context * ctx,
+                                int base, int adjusted, struct counter_effect_summary * effects)
+{
+	Unit * attacker = ctx->interceptor, * defender = ctx->defender;
+	char attack_pct[32], defense_pct[32];
+	format_counter_percent (attack_pct, sizeof attack_pct, effects->attacker_atk_pct);
+	format_counter_percent (defense_pct, sizeof defense_pct, effects->defender_def_pct);
+	int base_win = ((1024 - base) * 10000 + 512) / 1024;
+	int adjusted_win = ((1024 - adjusted) * 10000 + 512) / 1024;
+	snprintf (report, capacity,
+	          "Air combat counter test - FIRST ROUND\r\n"
+	          "Mission target: (%d, %d)\r\n\r\n"
+	          "Interceptor (ATTACKER): %.31s\r\n"
+	          "  Type ID: %d; Experience ID: %d; Base: (%d, %d)\r\n"
+	          "Mission aircraft (DEFENDER): %.31s\r\n"
+	          "  Type ID: %d; Experience ID: %d; Base: (%d, %d)\r\n\r\n"
+	          "Unit counters: %s; Loaded rules: %d\r\n"
+	          "Interceptor ATK: %s%% of base\r\n"
+	          "Mission aircraft DEF: %s%% of base\r\n"
+	          "Net ATK/DEF effect: %s\r\n\r\n"
+	          "Interceptor round win chance: %d.%02d%% -> %d.%02d%%\r\n"
+	          "Defender-win threshold: %d/1024 -> %d/1024\r\n\r\n"
+	          "These are combat-round odds, not interception probability.\r\n"
+	          "100%% of base means no net bonus or penalty.",
+	          ctx->tile_x, ctx->tile_y,
+	          p_bic_data->UnitTypes[attacker->Body.UnitTypeID].Name,
+	          attacker->Body.UnitTypeID, attacker->Body.Combat_Experience, attacker->Body.X, attacker->Body.Y,
+	          p_bic_data->UnitTypes[defender->Body.UnitTypeID].Name,
+	          defender->Body.UnitTypeID, defender->Body.Combat_Experience, defender->Body.X, defender->Body.Y,
+	          is->current_config.enable_unit_counters ? "ENABLED" : "DISABLED", is->current_config.count_counter_rules,
+	          attack_pct, defense_pct,
+	          (effects->attacker_atk_pct == COUNTER_SCALE && effects->defender_def_pct == COUNTER_SCALE) ? "UNCHANGED" : "CHANGED",
+	          base_win / 100, base_win % 100, adjusted_win / 100, adjusted_win % 100, base, adjusted);
+	report[capacity - 1] = '\0';
+}
+
+void __fastcall
+patch_Fighter_do_air_combat (Fighter * this, int edx, Unit * interceptor, Unit * defender, int tile_x, int tile_y)
+{
+	struct counter_air_combat_context saved_ctx = is->counter_air_combat_ctx;
+	char debug_report[1024];
+	debug_report[0] = '\0';
+	bool show_debug = is->current_config.debug_air_combat_counters && ! is_online_game ();
+	// Always replace the scope, even with counters disabled or invalid units:
+	// a nested call must never inherit an outer combat's aircraft/target.
+	is->counter_air_combat_ctx = (struct counter_air_combat_context) {
+		this, interceptor, defender, tile_x, tile_y, show_debug ? debug_report : NULL
+	};
+	Fighter_do_air_combat (this, __, interceptor, defender, tile_x, tile_y);
+	// The original function has several early returns (including zero strengths
+	// and network authority checks). All return here. It may destroy either unit,
+	// so do not dereference them during cleanup. Other counter contexts and the
+	// Fighter's ground-combat fields are never modified by this scope.
+	is->counter_air_combat_ctx = saved_ctx;
+	// A modal dialog can dispatch window messages. Restore the context FIRST,
+	// and use captured text only: the original call may have freed an aircraft.
+	if (show_debug) {
+		if (! debug_report[0])
+			snprintf (debug_report, sizeof debug_report,
+			          "Air combat entered at mission target (%d, %d), but no round odds were captured.\r\n"
+			          "The engine may have returned before resolving a round.", tile_x, tile_y);
+		MessageBoxA (NULL, debug_report, "C3X - Air combat counter test", MB_OK | MB_ICONINFORMATION);
+	}
+}
+
+int __fastcall
+patch_Fighter_get_odds_for_air_combat (Fighter * this, int edx, Unit * attacker, Unit * defender, bool bombarding, bool ignore_defensive_bonuses)
+{
+	struct counter_air_combat_context ctx = is->counter_air_combat_ctx;
+	int base = Fighter_get_combat_odds (this, __, attacker, defender, bombarding, ignore_defensive_bonuses);
+	bool apply_counters = is->current_config.enable_unit_counters && is->current_config.count_counter_rules > 0;
+	if (! ((apply_counters || ctx.debug_report != NULL) &&
+	       ctx.fighter == this && ctx.interceptor == attacker && ctx.defender == defender &&
+	       ! bombarding && unit_has_valid_type_id (attacker) && unit_has_valid_type_id (defender)))
+		return base;
+	struct counter_effect_summary effects;
+	init_neutral_counter_effect_summary (&effects);
+	int adjusted = base;
+	if (apply_counters) {
+		get_counter_effect_summary (&is->current_config, attacker, defender,
+		                            tile_at (ctx.tile_x, ctx.tile_y), &effects);
+		adjusted = counter_adjust_odds (base, effects.attacker_atk_pct, effects.defender_def_pct);
+	}
+	// This replacement is only at the odds call INSIDE do_air_combat, not at
+	// interception rolls or HUD/ground-combat calls. The engine already passes
+	// ignore_defensive_bonuses=true. Leave its base odds and RNG sequence intact.
+	if (ctx.debug_report != NULL && ! ctx.debug_report[0])
+		format_counter_air_combat_debug (ctx.debug_report, 1024, &ctx, base, adjusted, &effects);
+	return adjusted;
 }
 
 int __fastcall
