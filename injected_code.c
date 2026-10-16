@@ -220,6 +220,10 @@ get_city_ptr (int id)
 
 // Forward declarations for unit counter system (defined after their dependencies)
 enum recognizable_parse_result parse_counter_rule (char ** p_cursor, struct error_line ** p_unrecognized_lines, void * out_rule);
+enum recognizable_parse_result parse_city_sam_counter_rule (char ** p_cursor, struct error_line ** p_unrecognized_lines, void * out_rule);
+int __fastcall roll_counter_unit_air_defense (void * rng, int edx, int limit, int avoidance, Unit * aa, Unit * aircraft, int x, int y);
+int __fastcall roll_counter_city_air_defense (void * rng, int edx, int limit, int strength, Unit * aircraft);
+bool __fastcall patch_Unit_try_flying_over_tile (Unit * this, int edx, int x, int y);
 Unit * find_counter_best_defender_against (Unit * attacker, Tile * tile, int tile_x, int tile_y, Unit * excluded, bool require_visible, bool * out_any_counter_effect);
 Unit * find_counter_base_visible_defender_against (Main_Screen_Form * form, Unit * attacker, int tile_x, int tile_y, Unit * excluded);
 Unit * resolve_army_defending_member (Unit * army, Unit * attacker, bool sync_top_defender_id);
@@ -716,6 +720,10 @@ free_counter_rule_match_cache ()
 {
 	free (is->counter_match_cache.attacker_side_bits);
 	free (is->counter_match_cache.defender_side_bits);
+	free (is->counter_match_cache.air_defense_self_bits);
+	free (is->counter_match_cache.air_defense_enemy_bits);
+	free (is->counter_match_cache.city_sam_multipliers);
+	free (is->counter_match_cache.city_sam_match_bits);
 	is->counter_match_cache = (struct counter_rule_match_cache) {0};
 }
 
@@ -823,6 +831,9 @@ reset_to_base_config ()
 		cc->counter_rules = NULL;
 		cc->count_counter_rules = 0;
 	}
+	free (cc->city_sam_counters);
+	cc->city_sam_counters = NULL;
+	cc->count_city_sam_counters = 0;
 
 	table_deinit (&cc->recon_radius);
 
@@ -876,6 +887,8 @@ reset_to_base_config ()
 	// (base_config never owns valid pointers for them)
 	is->current_config.counter_rules             = NULL;
 	is->current_config.count_counter_rules       = 0;
+	is->current_config.city_sam_counters         = NULL;
+	is->current_config.count_city_sam_counters   = 0;
 
 	// Recreate loaded config names list with just the base config
 	is->loaded_config_names = malloc (sizeof *is->loaded_config_names);
@@ -3479,6 +3492,13 @@ load_config (char const * file_path, int path_is_relative_to_mod_dir)
 											 parse_counter_rule,
 											 (void **)&cfg->counter_rules,
 											 &cfg->count_counter_rules)))
+						handle_config_error_at (&p, value.str + recog_err_offset, CPE_BAD_VALUE);
+
+				} else if (slice_matches_str (&p.key, "city_sam_counters")) {
+					if (0 <= (recog_err_offset = read_recognizables (&value,
+							 &unrecognized_lines, sizeof (struct city_sam_counter_rule),
+							 parse_city_sam_counter_rule, (void **)&cfg->city_sam_counters,
+							 &cfg->count_city_sam_counters)))
 						handle_config_error_at (&p, value.str + recog_err_offset, CPE_BAD_VALUE);
 
 				// if key is for an obsolete option
@@ -9018,6 +9038,8 @@ is_counter_rule_option_token (struct string_slice const * token)
 	       slice_matches_str (token, "enemy-def") ||
 	       slice_matches_str (token, "self-bombard") ||
 	       slice_matches_str (token, "enemy-bombard") ||
+	       slice_matches_str (token, "self-air-defense") ||
+	       slice_matches_str (token, "enemy-air-defense") ||
 	       slice_matches_str (token, "terrain") ||
 	       slice_matches_str (token, "district") ||
 	       is_counter_rule_self_experience_token (token) ||
@@ -9108,6 +9130,31 @@ parse_counter_percent (char ** cursor, int * value)
 }
 
 enum recognizable_parse_result
+parse_city_sam_counter_rule (char ** p_cursor,
+                            struct error_line ** p_unrecognized_lines, void * out_rule)
+{
+	char * cur = *p_cursor;
+	struct string_slice name;
+	struct city_sam_counter_rule * r = out_rule;
+	*r = (struct city_sam_counter_rule) {UCM_ANY, -1, 100};
+	if (! parse_string (&cur, &name) || ! parse_counter_percent (&cur, &r->air_defense_pct))
+		return RPR_PARSE_ERROR;
+	*p_cursor = cur;
+	if (slice_matches_str (&name, "*"))
+		return RPR_OK;
+	if (find_unit_type_id_by_name (&name, 0, &r->aircraft_match))
+		return RPR_OK;
+	struct unit_type_tag * tag;
+	r->aircraft_match = UCM_TAG;
+	if (stable_look_up_slice (&is->current_config.unit_type_tags, &name, (int *)&tag)) {
+		r->aircraft_tag_id = tag->id;
+		return RPR_OK;
+	}
+	add_unrecognized_line (p_unrecognized_lines, &name);
+	return RPR_UNRECOGNIZED;
+}
+
+enum recognizable_parse_result
 parse_counter_rule (char ** p_cursor,
                     struct error_line ** p_unrecognized_lines,
                     void * out_rule)
@@ -9140,6 +9187,8 @@ parse_counter_rule (char ** p_cursor,
 		.enemy_def_pct  = 100,
 		.self_bombard_pct  = 100,
 		.enemy_bombard_pct = 100,
+		.self_air_defense_pct = 100,
+		.enemy_air_defense_pct = 100,
 	};
 	bool unrecognized_match = false;
 
@@ -9200,6 +9249,14 @@ parse_counter_rule (char ** p_cursor,
 				return RPR_PARSE_ERROR;
 		} else if (slice_matches_str (&token, "enemy-bombard")) {
 			if (! parse_counter_percent (&cur, &r->enemy_bombard_pct))
+				return RPR_PARSE_ERROR;
+		} else if (slice_matches_str (&token, "self-air-defense")) {
+			r->has_self_air_defense = true;
+			if (! parse_counter_percent (&cur, &r->self_air_defense_pct))
+				return RPR_PARSE_ERROR;
+		} else if (slice_matches_str (&token, "enemy-air-defense")) {
+			r->has_enemy_air_defense = true;
+			if (! parse_counter_percent (&cur, &r->enemy_air_defense_pct))
 				return RPR_PARSE_ERROR;
 		} else if (is_counter_rule_self_experience_token (&token)) {
 			enum recognizable_parse_result res =
@@ -9314,15 +9371,34 @@ rebuild_counter_rule_match_cache (struct c3x_config * cfg)
 	struct counter_rule_match_cache * c = &is->counter_match_cache;
 	c->rule_count = cfg->count_counter_rules;
 	c->unit_type_count = p_bic_data->UnitTypeCount;
+	c->city_sam_rule_count = cfg->count_city_sam_counters;
 	c->words = (c->rule_count + 31) / 32;
+	c->city_sam_words = (c->city_sam_rule_count + 31) / 32;
 	unsigned long long entries = (unsigned long long)c->words * c->unit_type_count;
-	if (! entries || entries > 0x3FFFFFFF)
+	unsigned long long sam_entries = (unsigned long long)c->city_sam_words * c->unit_type_count;
+	if (c->unit_type_count <= 0 || entries > 0x3FFFFFFF || sam_entries > 0x3FFFFFFF || c->unit_type_count > 0x1FFFFFFF)
 		return;
-	c->attacker_side_bits = calloc ((size_t)entries, sizeof (unsigned int));
-	c->defender_side_bits = calloc ((size_t)entries, sizeof (unsigned int));
-	if (! c->attacker_side_bits || ! c->defender_side_bits) {
+	if (entries) {
+		c->attacker_side_bits = calloc ((size_t)entries, sizeof (unsigned int));
+		c->defender_side_bits = calloc ((size_t)entries, sizeof (unsigned int));
+		c->air_defense_self_bits = calloc (c->words, sizeof (unsigned int));
+		c->air_defense_enemy_bits = calloc (c->words, sizeof (unsigned int));
+	}
+	if (c->city_sam_rule_count > 0) {
+		c->city_sam_multipliers = calloc (c->unit_type_count, sizeof (long long));
+		c->city_sam_match_bits = calloc ((size_t)sam_entries, sizeof (unsigned int));
+	}
+	if ((entries && (! c->attacker_side_bits || ! c->defender_side_bits ||
+	                 ! c->air_defense_self_bits || ! c->air_defense_enemy_bits)) ||
+	    (c->city_sam_rule_count > 0 && (! c->city_sam_multipliers || ! c->city_sam_match_bits))) {
 		free_counter_rule_match_cache ();
 		return;
+	}
+	for (int i = 0; i < c->rule_count; i++) {
+		if (cfg->counter_rules[i].self_air_defense_pct != 100 || cfg->counter_rules[i].has_self_air_defense)
+			c->air_defense_self_bits[i / 32] |= 1U << (i % 32);
+		if (cfg->counter_rules[i].enemy_air_defense_pct != 100 || cfg->counter_rules[i].has_enemy_air_defense)
+			c->air_defense_enemy_bits[i / 32] |= 1U << (i % 32);
 	}
 	for (int type = 0; type < c->unit_type_count; type++)
 		for (int i = 0; i < c->rule_count; i++) {
@@ -9334,6 +9410,18 @@ rebuild_counter_rule_match_cache (struct c3x_config * cfg)
 			if (unit_matches_counter_side (cfg, type, r->defender_match, r->defender_tag_id))
 				c->defender_side_bits[word] |= bit;
 		}
+	if (c->city_sam_multipliers)
+		for (int type = 0; type < c->unit_type_count; type++) {
+			long long m = COUNTER_SCALE;
+			for (int i = 0; i < c->city_sam_rule_count; i++) {
+				struct city_sam_counter_rule * r = &cfg->city_sam_counters[i];
+				if (unit_matches_counter_side (cfg, type, r->aircraft_match, r->aircraft_tag_id)) {
+					m = counter_multiply_percent (m, r->air_defense_pct);
+					c->city_sam_match_bits[type * c->city_sam_words + i / 32] |= 1U << (i % 32);
+				}
+			}
+			c->city_sam_multipliers[type] = m;
+		}
 	c->built = true;
 }
 
@@ -9342,6 +9430,7 @@ get_counter_rule_match_cache (struct c3x_config * cfg)
 {
 	struct counter_rule_match_cache * c = &is->counter_match_cache;
 	if (! c->built || c->rule_count != cfg->count_counter_rules ||
+	    c->city_sam_rule_count != cfg->count_city_sam_counters ||
 	    c->unit_type_count != p_bic_data->UnitTypeCount)
 		rebuild_counter_rule_match_cache (cfg);
 	return c;
@@ -9355,6 +9444,58 @@ format_counter_percent (char * dest, int capacity, long long multiplier)
 	if (! fraction) snprintf (dest, capacity, "%d", whole);
 	else if (fraction % 10 == 0) snprintf (dest, capacity, "%d.%d", whole, fraction / 10);
 	else snprintf (dest, capacity, "%d.%02d", whole, fraction);
+}
+
+long long
+get_counter_air_defense_modifier (struct c3x_config * cfg, Unit * aa, Unit * aircraft,
+                                 int x, int y, byte * matched_rules)
+{
+	if (! cfg->enable_unit_counters || cfg->count_counter_rules <= 0 || ! aa || ! aircraft ||
+	    aa->Body.UnitTypeID < 0 || aa->Body.UnitTypeID >= p_bic_data->UnitTypeCount ||
+	    aircraft->Body.UnitTypeID < 0 || aircraft->Body.UnitTypeID >= p_bic_data->UnitTypeCount)
+		return COUNTER_SCALE;
+	struct counter_rule_match_cache * c = get_counter_rule_match_cache (cfg);
+	if (! c->built)
+		return COUNTER_SCALE;
+	unsigned int * aa_self = c->attacker_side_bits + aa->Body.UnitTypeID * c->words;
+	unsigned int * aa_enemy = c->defender_side_bits + aa->Body.UnitTypeID * c->words;
+	unsigned int * plane_self = c->attacker_side_bits + aircraft->Body.UnitTypeID * c->words;
+	unsigned int * plane_enemy = c->defender_side_bits + aircraft->Body.UnitTypeID * c->words;
+	struct counter_tile_env env = {0};
+	long long m = COUNTER_SCALE;
+	for (int word = 0; word < c->words; word++) {
+		unsigned int forward = aa_self[word] & plane_enemy[word] & c->air_defense_self_bits[word];
+		unsigned int reverse = aa_enemy[word] & plane_self[word] & c->air_defense_enemy_bits[word];
+		unsigned int hits = forward | reverse;
+		while (hits) {
+			unsigned int bit = hits & (0U - hits);
+			int index = 0;
+			for (unsigned int shifted = bit; shifted > 1; shifted >>= 1) index++;
+			hits &= hits - 1;
+			struct counter_rule * r = &cfg->counter_rules[word * 32 + index];
+			bool f = (forward & bit) && counter_rule_experience_conditions_match (
+				r, aa->Body.Combat_Experience, aircraft->Body.Combat_Experience);
+			bool b = (reverse & bit) && counter_rule_experience_conditions_match (
+				r, aircraft->Body.Combat_Experience, aa->Body.Combat_Experience);
+			if (! f && ! b) continue;
+			if (! env.tile) env.tile = tile_at (x, y);
+			if (! counter_rule_environment_matches_env (cfg, r, &env)) continue;
+			if (matched_rules) matched_rules[word * 32 + index] = (f ? 1 : 0) | (b ? 2 : 0);
+			if (f) m = counter_multiply_percent (m, r->self_air_defense_pct);
+			if (b) m = counter_multiply_percent (m, r->enemy_air_defense_pct);
+		}
+	}
+	return m;
+}
+
+long long
+get_counter_city_sam_modifier (struct c3x_config * cfg, Unit * aircraft)
+{
+	if (! cfg->enable_unit_counters || cfg->count_city_sam_counters <= 0 || ! aircraft ||
+	    aircraft->Body.UnitTypeID < 0 || aircraft->Body.UnitTypeID >= p_bic_data->UnitTypeCount)
+		return COUNTER_SCALE;
+	struct counter_rule_match_cache * c = get_counter_rule_match_cache (cfg);
+	return c->built && c->city_sam_multipliers ? c->city_sam_multipliers[aircraft->Body.UnitTypeID] : COUNTER_SCALE;
 }
 
 void
@@ -18374,6 +18515,31 @@ emit_branch (enum branch_kind kind, byte * cursor, void const * target)
 	return int_to_bytes (cursor, offset);
 }
 
+// Enter via JMP at the original RNG CALL with its limit still on the stack.
+// All three binaries: ECX=rng, EBP=aircraft, EDI=AA unit / SAM strength,
+// ESI=unit-AA avoidance. After popping the limit, x/y are [esp+20]/[esp+24].
+// Helpers use fastcall, preserve EBX/ESI/EDI/EBP and pop their own arguments.
+// The two exits go directly to the original hit/miss branches (no fake rolls).
+void
+emit_counter_air_defense_airlock (byte * cursor, bool city, void * helper, void * hit, void * miss)
+{
+	*cursor++ = 0x58; // pop eax: native RNG limit
+	if (! city) {
+		byte coords[] = {0xFF, 0x74, 0x24, 0x24, 0xFF, 0x74, 0x24, 0x24};
+		memcpy (cursor, coords, sizeof coords); // push y; push x (offset shifts by 4)
+		cursor += sizeof coords;
+	}
+	*cursor++ = 0x55; // push ebp: aircraft
+	*cursor++ = 0x57; // push edi: AA / strength
+	if (! city) *cursor++ = 0x56; // push esi: avoidance
+	*cursor++ = 0x50; // push eax: original limit
+	cursor = emit_branch (BK_CALL, cursor, helper);
+	*cursor++ = 0x85; *cursor++ = 0xC0; // test eax, eax
+	*cursor++ = 0x74; *cursor++ = 0x05; // jz over the hit jump
+	cursor = emit_branch (BK_JUMP, cursor, hit);
+	emit_branch (BK_JUMP, cursor, miss); // Total: 32 bytes (unit), 23 (city).
+}
+
 // Just calls VirtualProtect and displays an error message if it fails. Made for use by the WITH_MEM_PROTECTION macro.
 bool
 check_virtual_protect (LPVOID addr, SIZE_T size, DWORD flags, PDWORD old_protect)
@@ -18463,6 +18629,19 @@ void
 apply_machine_code_edits (struct c3x_config const * cfg, bool at_program_start)
 {
 	DWORD old_protect, unused;
+	if (at_program_start) {
+		for (int city = 0; city < 2; city++) {
+			void * adapter = city ? ADDR_CITY_AA_AIRLOCK : ADDR_UNIT_AA_AIRLOCK;
+			void * site = city ? ADDR_CITY_AA_ROLL : ADDR_UNIT_AA_ROLL;
+			WITH_MEM_PROTECTION (adapter, INLEAD_SIZE, PAGE_EXECUTE_READWRITE)
+				emit_counter_air_defense_airlock (adapter, city,
+					city ? (void *)roll_counter_city_air_defense : (void *)roll_counter_unit_air_defense,
+					city ? ADDR_CITY_AA_HIT : ADDR_UNIT_AA_HIT,
+					city ? ADDR_CITY_AA_MISS : ADDR_UNIT_AA_MISS);
+			WITH_MEM_PROTECTION (site, 5, PAGE_EXECUTE_READWRITE)
+				emit_branch (BK_JUMP, site, adapter);
+		}
+	}
 
 	// Replace only the load of FoodPerCitizen. The following original instructions store ECX as the city's food yield.
 	WITH_MEM_PROTECTION (ADDR_CITY_CENTER_FOOD_BASE_LOAD, 6, PAGE_EXECUTE_READWRITE) {
@@ -20696,6 +20875,7 @@ patch_init_floating_point ()
 	is->saved_bombard_target_display_override_2 = (struct unit_display_override) {-1, -1, -1};
 	is->current_bombard_target_display_override = (struct unit_display_override) {-1, -1, -1};
 	is->counter_air_combat_ctx = (struct counter_air_combat_context) {0};
+	is->counter_air_defense_debug = NULL;
 	is->counter_defender_selection_ctx = (struct counter_defender_selection_context) {0};
 	is->counter_army_attacker_selection_ctx =
 		(struct counter_army_attacker_selection_context) {0};
@@ -24286,7 +24466,8 @@ patch_load_scenario (BIC * this, int edx, char * param_1, unsigned * param_2)
 		load_config (scenario_config_path, 0);
 	}
 	load_config ("custom.c3x_config.ini", 1);
-	if (is->current_config.enable_unit_counters && is->current_config.count_counter_rules > 0)
+	if (is->current_config.enable_unit_counters &&
+	    (is->current_config.count_counter_rules > 0 || is->current_config.count_city_sam_counters > 0))
 		rebuild_counter_rule_match_cache (&is->current_config);
 	apply_machine_code_edits (&is->current_config, false);
 
@@ -30377,7 +30558,7 @@ patch_Unit_perform_air_recon (Unit * this, int edx, int x, int y)
 		Tile_Body * tile = &tile_at (x, y)->Body;
 		int saved_vis = tile->Visibility;
 		tile->Visibility |= 1 << this->Body.CivID;
-		was_intercepted = Unit_try_flying_over_tile (this, __, x, y);
+		was_intercepted = patch_Unit_try_flying_over_tile (this, __, x, y);
 		tile->Visibility = saved_vis;
 	}
 
@@ -30775,7 +30956,7 @@ patch_Unit_try_flying_for_precision_strike (Unit * this, int edx, int x, int y)
 		return false;
 
 	} else
-		return Unit_try_flying_over_tile (this, __, x, y);
+		return patch_Unit_try_flying_over_tile (this, __, x, y);
 }
 
 void __fastcall
@@ -30842,23 +31023,195 @@ patch_rand_bombard_target (void * this, int edx, int lim)
 	return (is->bombard_stealth_target == NULL) ? rand_int (this, __, lim) : 2;
 }
 
-int __fastcall
-patch_rand_int_to_dodge_city_aa (void * this, int edx, int lim)
+// Debug-only math: count winning values in the actual integer roll range.
+// Binary search the monotone rational comparison; never sample or invoke RNG.
+void
+counter_air_defense_debug_outcomes (int limit, int avoidance, int strength,
+                                   long long multiplier, bool adjusted, int * wins, int * total)
 {
-	int tr = rand_int (this, __, lim);
-	is->result_of_roll_to_dodge_city_aa = tr;
-	return tr;
+	*total = adjusted ? COUNTER_AA_ROLL_LIMIT : (limit & 0xFFFF);
+	if (! *total) { // Native rand_int(0) still draws, but returns zero.
+		*total = 1;
+		*wins = avoidance <= 0;
+	} else if (! adjusted)
+		*wins = *total - clamp (0, *total, avoidance);
+	else {
+		int low = 0, high = *total;
+		while (low < high) {
+			int mid = low + (high - low) / 2;
+			if (counter_air_defense_roll_hits (mid, avoidance, strength, multiplier)) high = mid;
+			else low = mid + 1;
+		}
+		*wins = *total - low;
+	}
+}
+
+// Label resolution is only for report formatting, outside the rule evaluator.
+char const *
+counter_air_defense_debug_match_name (int match, int tag_id)
+{
+	if (match == UCM_ANY) return "*";
+	if (match == UCM_TAG) {
+		FOR_TABLE_ENTRIES (entry, &is->current_config.unit_type_tags)
+			if (((struct unit_type_tag *)entry.value)->id == tag_id)
+				return (char const *)entry.key;
+		return "(unknown tag)";
+	}
+	return match >= 0 && match < p_bic_data->UnitTypeCount ? p_bic_data->UnitTypes[match].Name : "(invalid type)";
+}
+
+struct counter_air_defense_debug_page *
+new_counter_air_defense_debug_page (struct counter_air_defense_debug * ctx, char const * header)
+{
+	struct counter_air_defense_debug_page * page = calloc (1, sizeof *page);
+	if (! page) { ctx->allocation_failed = true; return NULL; }
+	if (ctx->last) ctx->last->next = page;
+	else ctx->first = page;
+	ctx->last = page;
+	snprintf (page->text, sizeof page->text, "%s", header);
+	return page;
+}
+
+void
+capture_counter_air_defense_debug (struct counter_air_defense_debug * ctx, Unit * aa, Unit * aircraft,
+                                   int limit, int avoidance, int strength, long long multiplier,
+                                   bool adjusted, int roll, bool hit, byte const * matched_rules)
+{
+	if (! ctx) return;
+	bool city = aa == NULL;
+	struct c3x_config * cfg = &is->current_config;
+	struct counter_rule_match_cache * cache = &is->counter_match_cache;
+	int base_wins, base_total, wins, total;
+	counter_air_defense_debug_outcomes (limit, avoidance, strength, COUNTER_SCALE, false, &base_wins, &base_total);
+	counter_air_defense_debug_outcomes (limit, avoidance, strength, multiplier, adjusted, &wins, &total);
+	int before = (10000LL * base_wins + base_total / 2) / base_total;
+	int after = (10000LL * wins + total / 2) / total;
+	long long applied = adjusted ? multiplier : COUNTER_SCALE;
+	char header[1200];
+	snprintf (header, sizeof header,
+		"%s counter test - shot %d\r\nMission target: (%d, %d)\r\n"
+		"Aircraft: %.31s (type %d, experience %d)\r\n"
+		"Air defense: %.31s\r\nBase strength: %d; avoidance term: %d\r\n"
+		"Unit counters: %s; Loaded rules: %d\r\n"
+		"Rule multiplier: %d.%04d%% of base\r\nApplied multiplier: %d.%04d%% of base\r\n"
+		"Kill chance (this shot): %d.%02d%% -> %d.%02d%%\r\n"
+		"Winning roll values: %d/%d -> %d/%d\r\n"
+		"Actual roll: %d; RNG bound: %d; Result: %s\r\n"
+		"%s\r\nMatched %s rules (1-based list index):\r\n",
+		city ? "City SAM" : "Unit AA", ++ctx->shots, ctx->x, ctx->y,
+		counter_air_defense_debug_match_name (aircraft->Body.UnitTypeID, -1),
+		aircraft->Body.UnitTypeID, aircraft->Body.Combat_Experience,
+		city ? "City building AirPower" : counter_air_defense_debug_match_name (aa->Body.UnitTypeID, -1),
+		strength, avoidance, cfg->enable_unit_counters ? "ENABLED" : "DISABLED",
+		city ? cfg->count_city_sam_counters : cfg->count_counter_rules,
+		(int)(multiplier / 10000), (int)(multiplier % 10000), (int)(applied / 10000), (int)(applied % 10000),
+		before / 100, before % 100, after / 100, after % 100, base_wins, base_total, wins, total,
+		roll, adjusted ? COUNTER_AA_ROLL_LIMIT : (limit & 0xFFFF), hit ? "SHOT DOWN" : "DODGED",
+		city ? "Conditional on SAM interception; interception chance is unchanged." : "Per selected AA unit; not the combined chance of all units.",
+		city ? "city_sam_counters" : "counter_rules");
+	header[sizeof header - 1] = '\0';
+	struct counter_air_defense_debug_page * page = new_counter_air_defense_debug_page (ctx, header);
+	if (! page) return;
+	int used = strlen (page->text), lines = 0, matches = 0;
+	int count = city ? cfg->count_city_sam_counters : cfg->count_counter_rules;
+	bool available = ! count || (cache->built && (city ? (cache->city_sam_match_bits &&
+		aircraft->Body.UnitTypeID >= 0 && aircraft->Body.UnitTypeID < cache->unit_type_count) : matched_rules != NULL));
+	if (cfg->enable_unit_counters && available)
+		for (int i = 0; i < count; i++) {
+			unsigned int directions = city ?
+				((cache->city_sam_match_bits[aircraft->Body.UnitTypeID * cache->city_sam_words + i / 32] >> (i % 32)) & 1) :
+				matched_rules[i];
+			for (int reverse = 0; reverse < 2; reverse++) {
+				if (! (directions & (1U << reverse))) continue;
+				if (lines == 12) { // Paginate, never silently omit matching rules.
+					page = new_counter_air_defense_debug_page (ctx, header);
+					if (! page) return;
+					used = strlen (page->text); lines = 0;
+				}
+				char line[256];
+				if (city) {
+					struct city_sam_counter_rule * r = &cfg->city_sam_counters[i];
+					snprintf (line, sizeof line, "#%d %.64s: %d%%\r\n", i + 1,
+						counter_air_defense_debug_match_name (r->aircraft_match, r->aircraft_tag_id), r->air_defense_pct);
+				} else {
+					struct counter_rule * r = &cfg->counter_rules[i];
+					snprintf (line, sizeof line, "#%d %.64s vs %.64s: %s-air-defense %d%%\r\n", i + 1,
+						counter_air_defense_debug_match_name (r->attacker_match, r->attacker_tag_id),
+						counter_air_defense_debug_match_name (r->defender_match, r->defender_tag_id),
+						reverse ? "enemy" : "self", reverse ? r->enemy_air_defense_pct : r->self_air_defense_pct);
+				}
+				line[sizeof line - 1] = '\0';
+				snprintf (page->text + used, sizeof page->text - used, "%s", line);
+				used = strlen (page->text); lines++; matches++;
+			}
+		}
+	if (! matches)
+		snprintf (page->text + used, sizeof page->text - used, "%s\r\n",
+			! cfg->enable_unit_counters ? "None applied (counters disabled)." :
+			! available ? "Rule trace unavailable (allocation/cache failure)." : "None.");
+	// No Unit/config pointers are kept in a page; either may disappear before display.
+}
+
+bool __fastcall
+patch_Unit_try_flying_over_tile (Unit * this, int edx, int x, int y)
+{
+	struct counter_air_defense_debug report = {this, x, y};
+	struct counter_air_defense_debug * saved = is->counter_air_defense_debug;
+	is->counter_air_defense_debug = is->current_config.debug_air_combat_counters && ! is_online_game () ? &report : NULL;
+	bool result = Unit_try_flying_over_tile (this, __, x, y);
+	is->counter_air_defense_debug = saved; // Restore before any modal message processing.
+	for (struct counter_air_defense_debug_page * page = report.first; page != NULL;) {
+		struct counter_air_defense_debug_page * next = page->next;
+		MessageBoxA (NULL, page->text, "C3X - Air defense counter test", MB_OK | MB_ICONINFORMATION);
+		free (page);
+		page = next;
+	}
+	if (report.allocation_failed)
+		MessageBoxA (NULL, "Some air-defense debug details could not be recorded (allocation failed).",
+		             "C3X - Air defense counter test", MB_OK | MB_ICONINFORMATION);
+	return result;
+}
+
+// These are called only at the two verified post-selection RNG sites, through
+// register adapters. All original candidate, interception, mission-charge,
+// lethal, animation, ownership and network-message branches remain in engine code.
+int __fastcall
+roll_counter_unit_air_defense (void * rng, int edx, int limit, int avoidance,
+                              Unit * aa, Unit * aircraft, int x, int y)
+{
+	struct counter_air_defense_debug * ctx = is->counter_air_defense_debug;
+	if (ctx && ctx->aircraft != aircraft) ctx = NULL;
+	byte * matched = ctx && is->current_config.count_counter_rules > 0 ? calloc (is->current_config.count_counter_rules, 1) : NULL;
+	long long m = get_counter_air_defense_modifier (&is->current_config, aa, aircraft, x, y, matched);
+	// Preserve even the engine's overflow/16-bit-bound behavior for neutral rules.
+	bool adjusted = m != COUNTER_SCALE && avoidance >= 0 && limit > avoidance;
+	int roll = rand_int (rng, __, adjusted ? COUNTER_AA_ROLL_LIMIT : limit) & 0xFFFF;
+	bool hit = adjusted ? counter_air_defense_roll_hits (roll, avoidance, limit - avoidance, m) : roll >= avoidance;
+	if (ctx) {
+		int strength = aa && aa->Body.UnitTypeID >= 0 && aa->Body.UnitTypeID < p_bic_data->UnitTypeCount ?
+			p_bic_data->UnitTypes[aa->Body.UnitTypeID].Air_Defence : 0;
+		capture_counter_air_defense_debug (ctx, aa, aircraft, limit, avoidance, strength, m, adjusted, roll, hit, matched);
+		free (matched);
+	}
+	return hit;
 }
 
 int __fastcall
-patch_Unit_get_defense_to_dodge_city_aa (Unit * this)
+roll_counter_city_air_defense (void * rng, int edx, int limit, int strength, Unit * aircraft)
 {
-	int defense = Unit_get_defense_strength (this);
-	if (is->current_config.show_message_after_dodging_sam &&
-	    (defense > is->result_of_roll_to_dodge_city_aa) &&
-	    (this->Body.CivID == p_main_screen_form->Player_CivID))
-		show_map_specific_text (this->Body.X, this->Body.Y, is->c3x_labels[CL_DODGED_SAM], 0);
-	return defense;
+	long long m = get_counter_city_sam_modifier (&is->current_config, aircraft);
+	bool adjusted = m != COUNTER_SCALE && strength > 0 && limit >= strength;
+	int roll = rand_int (rng, __, adjusted ? COUNTER_AA_ROLL_LIMIT : limit) & 0xFFFF;
+	// Retain the second native defense query, after the RNG call.
+	int defense = Unit_get_defense_strength (aircraft);
+	bool hit = adjusted ? counter_air_defense_roll_hits (roll, defense, strength, m) : roll >= defense;
+	struct counter_air_defense_debug * ctx = is->counter_air_defense_debug;
+	if (ctx && ctx->aircraft == aircraft)
+		capture_counter_air_defense_debug (ctx, NULL, aircraft, limit, defense, strength, m, adjusted, roll, hit, NULL);
+	if (is->current_config.show_message_after_dodging_sam && ! hit &&
+	    aircraft->Body.CivID == p_main_screen_form->Player_CivID)
+		show_map_specific_text (aircraft->Body.X, aircraft->Body.Y, is->c3x_labels[CL_DODGED_SAM], 0);
+	return hit;
 }
 
 int __fastcall
@@ -32399,7 +32752,7 @@ patch_Fighter_apply_zone_of_control (Fighter * this, int edx, Unit * unit, int f
 
 	// Actually exert ZoC if an air unit managed to do so.
 	if ((is->zoc_interceptor != NULL) && (p_bic_data->UnitTypes[is->zoc_interceptor->Body.UnitTypeID].Unit_Class == UTC_Air)) {
-		bool intercepted = Unit_try_flying_over_tile (is->zoc_interceptor, __, from_x, from_y);
+		bool intercepted = patch_Unit_try_flying_over_tile (is->zoc_interceptor, __, from_x, from_y);
 		if (! intercepted) {
 			Unit_play_bombing_animation (is->zoc_interceptor, __, from_x, from_y);
 			unit->Body.Damage = not_below (0, unit->Body.Damage + 1);
@@ -32691,7 +33044,7 @@ patch_Fighter_damage_by_db_in_main_loop (Fighter * this, int edx, Unit * bombard
 	is->unit_display_override_2 = bombard_target_udo;
 
 	if (p_bic_data->UnitTypes[bombarder->Body.UnitTypeID].Unit_Class == UTC_Air) {
-		if (Unit_try_flying_over_tile (bombarder, __, defender->Body.X, defender->Body.Y)) {
+		if (patch_Unit_try_flying_over_tile (bombarder, __, defender->Body.X, defender->Body.Y)) {
 			is->unit_display_override = saved_udo;
 			is->unit_display_override_2 = saved_udo_2;
 			return; // intercepted

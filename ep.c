@@ -1019,6 +1019,10 @@ ENTRY_POINT ()
 	i_next_free_inlead++;
 
 	tcc__define_symbol (tcc, "INLEAD_SIZE", temp_format ("%u", sizeof (struct inlead)));
+	// Two 32-byte register adapters for the native unit-AA and city-SAM rolls.
+	ASSERT (i_next_free_inlead + 1 < inleads_capacity);
+	tcc__define_symbol (tcc, "ADDR_UNIT_AA_AIRLOCK", temp_format ("((void *)0x%x)", (int)&inleads[i_next_free_inlead++]));
+	tcc__define_symbol (tcc, "ADDR_CITY_AA_AIRLOCK", temp_format ("((void *)0x%x)", (int)&inleads[i_next_free_inlead++]));
 
 	// Compile C code to inject
 	{

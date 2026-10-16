@@ -298,6 +298,15 @@ struct counter_rule {
 	int    enemy_def_pct;
 	int    self_bombard_pct;
 	int    enemy_bombard_pct;
+	int    self_air_defense_pct;
+	int    enemy_air_defense_pct;
+	bool   has_self_air_defense, has_enemy_air_defense; // Include explicit 100% effects in debug traces.
+};
+
+// City SAM has no defending Unit. Match only the incoming aircraft.
+struct city_sam_counter_rule {
+	int aircraft_match, aircraft_tag_id;
+	int air_defense_pct;
 };
 
 struct counter_effect_summary {
@@ -310,9 +319,25 @@ struct counter_effect_summary {
 
 struct counter_rule_match_cache {
 	bool built;
-	int rule_count, unit_type_count, words;
+	int rule_count, unit_type_count, words, city_sam_rule_count;
 	unsigned int * attacker_side_bits;
 	unsigned int * defender_side_bits;
+	unsigned int * air_defense_self_bits, * air_defense_enemy_bits;
+	long long * city_sam_multipliers; // Precompiled per aircraft type, in rule order.
+	int city_sam_words;
+	unsigned int * city_sam_match_bits; // Per-aircraft rule identities for debug reports.
+};
+
+struct counter_air_defense_debug_page {
+	struct counter_air_defense_debug_page * next;
+	char text[4096];
+};
+
+struct counter_air_defense_debug {
+	Unit * aircraft;
+	int x, y, shots;
+	bool allocation_failed;
+	struct counter_air_defense_debug_page * first, * last;
 };
 
 struct c3x_config {
@@ -503,6 +528,8 @@ struct c3x_config {
 	bool debug_air_combat_counters;
 	struct counter_rule * counter_rules;
 	int count_counter_rules;
+	struct city_sam_counter_rule * city_sam_counters;
+	int count_city_sam_counters;
 
 	bool enable_trade_net_x;
 	bool optimize_improvement_loops;
@@ -2118,10 +2145,6 @@ struct injected_state {
 	// be suitable for attack via bombardment.
 	int selecting_stealth_target_for_bombard;
 
-	// Set in rand_int_to_dodge_city_aa and read immediately after in Unit_get_defense_to_dodge_city_aa. Allows us to determine whether the dodge
-	// roll was successful in order to popup the message.
-	int result_of_roll_to_dodge_city_aa;
-
 	// Initialized to NULL. If set to non-NULL, the next call to show_map_message will consume that value and use it as the text on the
 	// message. Used to implement show_map_specific_text.
 	char const * map_message_text_override;
@@ -2178,6 +2201,8 @@ struct injected_state {
 	struct unit_display_override current_bombard_target_display_override;
 
 	struct counter_rule_match_cache counter_match_cache;
+	// Stack-owned scope; preformatted pages survive destroyed aircraft and modal reentry.
+	struct counter_air_defense_debug * counter_air_defense_debug;
 	// Scoped to Fighter::do_air_combat, including its network-message entry.
 	// Aircraft remain at their bases; environment rules use the mission target.
 	struct counter_air_combat_context {

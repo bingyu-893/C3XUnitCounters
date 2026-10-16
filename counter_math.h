@@ -116,4 +116,22 @@ counter_compare_strengths (struct counter_strength_ratio a, struct counter_stren
 	return counter_compare_products (left, right, 4);
 }
 
+/* rand_int masks its bound to 16 bits: 65536 would produce a zero bound.
+ * For an adjusted shot draw once in [0,65535), then compare the rational
+ * r/65535 >= avoidance / (avoidance + strength * multiplier/COUNTER_SCALE).
+ * No integer Air_Defence is ever manufactured. The factored comparison also
+ * handles INT_MAX strength and saturated multipliers without overflow. */
+#define COUNTER_AA_ROLL_LIMIT 65535
+static int
+counter_air_defense_roll_hits (int roll, int avoidance, int strength, long long multiplier)
+{
+	if (strength <= 0 || multiplier <= 0)
+		return 0;
+	if (avoidance <= 0)
+		return 1;
+	unsigned long long hit[] = {roll, strength, multiplier};
+	unsigned long long dodge[] = {COUNTER_AA_ROLL_LIMIT - roll, avoidance, COUNTER_SCALE};
+	return counter_compare_products (hit, dodge, 3) >= 0;
+}
+
 #endif
